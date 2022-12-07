@@ -22,7 +22,7 @@ In the injected assembly, branch everything so that it favors either always devi
 
 > \*No guarantee this mode will ever be implemented.
 
-Compiler options for controlling heap for shared memory:
+Compiler options for controlling heap for shared memory. These are only valid when "system allocations" is not specified at compile time.
 - Default: some significant fraction of maximum working set size, such as 1/8.
 - Custom by fraction: a proportion of maximum working set size.
 - Custom by absolute size: specify the heap's size in gigabytes.
