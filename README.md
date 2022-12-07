@@ -14,7 +14,7 @@ High-performance route with limited capabilities (default):
 - Apple GPU cores contain 31 slots for binding Metal buffers. Allocate an extra buffer binding for when you exceed 31 buffers. An indirect buffer will store the extra arguments. All indirectly stored arguments must be annotated as USM pointers, because you first load them into GPU registers, copying by value. Their address will still be translated to the GPU version during encoding.
 - If you have exactly 31 arguments, locate the last one in an indirect buffer binding. That way, there's never more than 30 genuine buffers bound. This simplifies some compiler logic and reduces the chance of bugs regarding the 31st argument.
 
-In the injected assembly, branch everything so that it favors either always device or always shared pointers. This approach avoids needing to copy stuff between registers when translating pointers. However, it bloats the code slightly more and reduces performance when simultaneously fetching device + shared pointers from different threads in the SIMD. Create a compile-time option to choose which USM mode to favor.
+In the injected assembly, branch everything so that it favors either always device or always shared pointers. This approach avoids needing to copy stuff between registers when translating pointers. However, it bloats the code slightly more and reduces performance when simultaneously fetching device + shared pointers from different threads in a SIMD. Setting that aside, there are compile-time options to choose which USM mode to favor:
 - Disable shared memory - fastest performance and no injected assembly. Does not tag bound buffer pointers when copying by value. `aspect::usm_shared_allocations` returns false.
 - Default - assumes most computations use device memory. 0.5 cycle penalty for every memory access, except from first 30 pointers captured as lambda arguments in SYCL C++ source.
 - Optimize shared memory - assume most computations use shared memory. Up to 4.0 cycle penalty for every memory access. Translates the address before checking its upper 16 bits, allowing certain compiler optimizations.
@@ -22,7 +22,7 @@ In the injected assembly, branch everything so that it favors either always devi
 
 > \*No guarantee this mode will ever be implemented.
 
-Compiler options for controlling heap for shared memory. These are only valid when "system allocations" is not specified at compile time.
+Here are compiler options for controlling the heap for shared memory. These are only valid when "system allocations" is not specified at compile time.
 - Default: some significant fraction of maximum working set size, such as 1/8.
 - Custom by fraction: a proportion of maximum working set size.
 - Custom by absolute size: specify the heap's size in gigabytes.
