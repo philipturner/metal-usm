@@ -11,4 +11,4 @@ Ideas:
 Branch everything so that it favors always device or always shared pointers. This will avoid needing to copy stuff between registers for device pointers. However, it will bloat the code slightly more and reduce performance when fetching both device/shared pointers from different threads in the SIMD. Create a compile-time option to choose which USM mode to favor.
 - Disable shared memory - fastest performance and no shared memory.
 - Default - assumes most computations use device memory. 0.5 cycle penalty for every memory access.
-- Optimize shared memory - assume most computations will use shared memory. 2.5 cycle penalty for every memory access.
+- Optimize shared memory - assume most computations use shared memory. 2.5 cycle penalty for every memory access.
