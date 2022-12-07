@@ -13,3 +13,4 @@ Branch everything so that it favors always device or always shared pointers. Thi
 - Disable shared memory - fastest performance and no shared memory. Does not tag bound buffer pointers when copying by value.
 - Default - assumes most computations use device memory. 0.5 cycle penalty for every memory access.
 - Optimize shared memory - assume most computations use shared memory. 2.5 cycle penalty for every memory access.
+- System allocations - enable the "low performance route" idea described above. Reserves a few GPU registers for address translation, to avoid invoking a function call.
