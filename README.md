@@ -9,6 +9,6 @@ Ideas:
 - Allocate an extra buffer binding for when you exceed 31 buffers. Pointers here must be treated like USM pointers, because you first load them into shader memory, copying by value.
 
 Branch everything so that it favors always device or always shared pointers. This will avoid needing to copy stuff between registers for device pointers. However, it will bloat the code slightly more and reduce performance when fetching both device/shared pointers from different threads in the SIMD. Create a compile-time option to choose which USM mode to favor.
-- Disable shared memory - fastest performance and no shared memory.
+- Disable shared memory - fastest performance and no shared memory. No longer tags bound buffer pointers before copying by value.
 - Default - assumes most computations use device memory. 0.5 cycle penalty for every memory access.
 - Optimize shared memory - assume most computations use shared memory. 2.5 cycle penalty for every memory access.
