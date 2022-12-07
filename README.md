@@ -26,6 +26,6 @@ Here are compiler options for controlling the heap for shared memory. These are 
 - Default: some significant fraction of maximum working set size, such as 1/8.
 - Custom by fraction: a proportion of maximum working set size.
 - Custom by absolute size: specify the heap's size in gigabytes.
-- Adaptive\*: start with either default or custom size, but dynamically expand until reaching a pre-determined upper bound (e.g. 3/4 working set size, can be customized). Afterward, throw an out-of-memory error. While reallocating the heap during expansion, flush all queues and halt GPU work to ensure memory safety. The heap may also automatically contract if enough memory is released, for enough time.
+- Adaptive\*: start with either default or custom size, but dynamically expand until reaching a pre-determined upper bound (e.g. 3/4 working set size, can be customized). Afterward, throw an out-of-memory error. While reallocating the heap during expansion, flush all queues and halt GPU work to ensure memory safety. The heap may automatically contract if enough memory is released, for enough time.
 
 > \*No guarantee this mode will ever be implemented.
