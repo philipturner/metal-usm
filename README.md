@@ -1,6 +1,6 @@
 # Metal Unified Shared Memory
 
-Access CPU pointers from Metal shaders
+Draft of the USM implementation for the hipSYCL Metal backend.
 
 Low performance route with higher capabilities:
 - Subdivide all of physical memory into ~8 MB chunks. Create a one-step lookup table that maps chunks of `malloc`'d CPU memory to GPU memory. `malloc`'d addresses typically fall into a range with the same magnitude as physical RAM, offset by 4 GB.
