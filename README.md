@@ -18,7 +18,7 @@ In the injected assembly, branch everything so that it favors either always devi
 - Disable shared memory - fastest performance and no injected assembly. Does not tag bound buffer pointers when copying by value. `aspect::usm_shared_allocations` returns false.
 - Default - assumes most computations use device memory. 1 cycle penalty for every memory access, except from the first 30 pointers captured as lambda arguments in SYCL C++ source.
 - Optimize shared memory - assume most computations use shared memory. Up to 5 cycle penalty for every memory access. Translates the address before checking its upper 16 bits, allowing certain compiler optimizations.
-- System allocations\* - enable the "low performance route" idea described above. ~10 cycle penalty for every memory access. Reserves a few GPU registers for address translation, to avoid invoking a function call. `aspect::usm_system_allocations` returns true.
+- System allocations\* - enable the "low performance route" idea described above. ~15 cycle penalty for every memory access. Reserves a few GPU registers for address translation, to avoid invoking a function call. `aspect::usm_system_allocations` returns true.
 
 > \*No guarantee this mode will ever be implemented.
 
