@@ -2,6 +2,8 @@
 
 Draft of the USM implementation for the hipSYCL Metal backend.
 
+> TODO: What to do when writing GPU pointers back to CPU memory, after having been converted from CPU -> GPU during encoding? Or other functionality where you expect a certain address to not change.
+
 Low performance route with higher capabilities:
 - Subdivide all of physical memory into ~8 MB chunks. Create a one-step lookup table that maps chunks of `malloc`'d CPU memory to GPU memory. `malloc`'d addresses typically fall into a range with the same magnitude as physical RAM, offset by 4 GB.
 - Virtual memory addresses, which typically exceed RAM size, fall into a two-step lookup table.
