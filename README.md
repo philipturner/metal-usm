@@ -17,10 +17,10 @@ High-performance route with limited capabilities (default):
 In the injected assembly, branch everything so that it favors either always device or always shared pointers. This approach avoids needing to copy stuff between registers when translating pointers. However, it bloats the code slightly more and reduces performance when simultaneously fetching device + shared pointers from different threads in a SIMD. Setting that aside, there are compile-time options to choose which USM mode to favor:
 - Disable shared memory - fastest performance and no injected assembly. Does not tag bound buffer pointers when copying by value. `aspect::usm_shared_allocations` returns false.
 - Default - assumes most computations use device memory. 1 cycle penalty for every memory access, except from the first 30 pointers captured as lambda arguments in SYCL C++ source.
-- Optimize shared memory - assume most computations use shared memory. Up to 5 cycle penalty for every memory access. Translates the address before checking its upper 16 bits, allowing certain compiler optimizations.
+- Optimize shared memory\* - assume most computations use shared memory. Up to 5 cycle penalty for every memory access. Translates the address before checking its upper 16 bits, allowing certain compiler optimizations.
 - System allocations\* - enable the "low performance route" idea described above. >10 cycle penalty for every memory access. Reserves a few GPU registers for address translation, to avoid invoking a function call. `aspect::usm_system_allocations` returns true.
 
-> \*No guarantee this mode will ever be implemented.
+> \*No guarantee these modes will ever be implemented.
 
 Here are compiler options for controlling the heap for shared memory. These are only valid when "system allocations" is not specified at compile time.
 - Default: some significant fraction of maximum working set size, such as 1/8.
