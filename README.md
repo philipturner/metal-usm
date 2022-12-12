@@ -2,8 +2,6 @@
 
 Draft of the USM implementation for the hipSYCL Metal backend.
 
-> TODO: What to do when writing GPU pointers back to CPU memory, after having been converted from CPU -> GPU during encoding? Or other functionality where you expect a certain address to not change.
-
 Low performance route with higher capabilities:
 - Subdivide all of physical memory into ~8 MB chunks. Create a one-step lookup table that maps chunks of `malloc`'d CPU memory to GPU memory. `malloc`'d addresses typically fall into a range with the same magnitude as physical RAM, offset by 4 GB.
 - Virtual memory addresses, which typically exceed RAM size, fall into a two-step lookup table.
@@ -31,3 +29,11 @@ Here are compiler options for controlling the heap for shared memory. These are 
 - Adaptive\*: start with either default or custom size, but dynamically expand until reaching a pre-determined upper bound (e.g. 3/4 working set size, can be customized). Afterward, throw an out-of-memory error. The heap may automatically contract if enough memory is released, for enough time. While reallocating the heap during expansion, flush all queues and halt GPU work to ensure memory safety.
 
 > \*No guarantee this mode will ever be implemented.
+
+## The Problem of Changing Addresses
+
+Imagine that you pass a CPU pointer into a GPU kernel, which will then pass it into a CPU-accessible data structure. During encoding, the captured pointer argument was translated into the GPU address space. The CPU will segfault when reading from the pointer. There are also other issues. For example, what if you simply cast an integer to a pointer, then capture it by the kernel? The backend would change its value by a constant offset, which you don't want. It may not be valid to process threadgroup memory pointers this way, but it seems quite useful for RAM memory pointers.
+
+Given that USM shared memory is enabled, the compiler will have to examine the pointer in IR. Based on how it's used, it may have to translate from the GPU address space back to the CPU address space. Here's how that works.
+
+1. At compile time, you don't know whether a pointers was stored in the CPU or GPU address space. The user could have fetched either a "shared" pointer from the small `MTLHeap` or a "device"-only pointer that can utilize much greater memory. We can't restrict pointers to being "shared"-only in order to fix this problem, because that drastically limits the maximum allocatable memory.
