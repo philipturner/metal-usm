@@ -34,6 +34,6 @@ Here are compiler options for controlling the heap for shared memory. These are 
 
 Imagine that you pass a CPU pointer into a GPU kernel, which will then pass it into a CPU-accessible data structure. During encoding, the captured pointer argument was translated into the GPU address space. The CPU will segfault when reading from the pointer. There are also other issues. For example, what if you simply cast an integer to a pointer, then capture it by the kernel? The backend would change its value by a constant offset, which you don't want. It may not be valid to process threadgroup memory pointers this way, but it seems quite useful for RAM memory pointers.
 
-Given that USM shared memory is enabled, the compiler will have to examine the pointer in IR. Based on how it's used, it may have to translate from the GPU address space back to the CPU address space. Here's how that works.
+Given that USM shared memory is enabled, the compiler will have to examine the pointer in IR. Based on how it's used, we may have to translate from the GPU address space back to the CPU address space. Here's how that works.
 
 1. At compile time, you don't know whether a pointers was stored in the CPU or GPU address space. The user could have fetched either a "shared" pointer from the small `MTLHeap` or a "device"-only pointer that can utilize much greater memory. We can't restrict pointers to being "shared"-only in order to fix this problem, because that drastically limits the maximum allocatable memory.
