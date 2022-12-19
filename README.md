@@ -51,4 +51,4 @@ One solution is, limit all USM allocations (even device ones) to a single ~2 GB 
 
 https://tallendev.github.io/assets/papers/sc21.pdf
 
-TODO: Pitch this concern to the SYCL spec maintainers, ask about expectations for performance of USM. Is 2 GB enough for a typical GPU program, even when 32 GB of physical and 1000 GB of virtual RAM are possible? Do I want to take away access to the M1 GPU's massive virtual memory pool, or is it okay to just use SYCL accessors for that purpose?
+<!--TODO: Pitch this concern to the SYCL spec maintainers, ask about expectations for performance of USM.--> Is 2 GB enough for a typical GPU program, even when 32 GB of physical and 1000 GB of virtual RAM are possible? Do I want to take away access to the M1 GPU's massive virtual memory pool, or is it okay to just use SYCL accessors for that purpose?
