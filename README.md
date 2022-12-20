@@ -2,7 +2,7 @@
 
 Draft of the USM implementation for the hipSYCL Metal backend.
 
-> Note: This document needs to be rewritten. Recent discoveries (explained in the last section) warrant major changes to my approach.
+> Note: This document needs to be rewritten. Recent discoveries (explained in the last section) warrant major changes to this approach.
 
 Low performance route with higher capabilities:
 - Subdivide all of physical memory into ~8 MB chunks. Create a one-step lookup table that maps chunks of `malloc`'d CPU memory to GPU memory. `malloc`'d addresses typically fall into a range with the same magnitude as physical RAM, offset by 4 GB.
