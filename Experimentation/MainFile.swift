@@ -38,8 +38,9 @@ func deallocBuffer(bufferID: Int, offset: Int, length: Int) {
 
 func mainFunc() {
   defer { print("Execution finished.") }
-//  MAP_FIXED | MAP_ANONYMOUS
+  //  MAP_FIXED | MAP_ANONYMOUS
   //  PROT_READ | PROT_WRITE
+  
   print("EACCESS", EACCES)
   print("EAGAIN", EAGAIN)
   print("EBADF", EBADF)
@@ -53,10 +54,10 @@ func mainFunc() {
   print("SIGSEGV", SIGSEGV)
   print("SIGBUS", SIGBUS)
   
-  let temporary_file = tmpfile()!
-  print(fileno(temporary_file))
-  let fd = fileno(temporary_file)
-  ftruncate(fd, 1024 * 1024);
+  //  let temporary_file = tmpfile()!
+  //  print(fileno(temporary_file))
+  //  let fd = fileno(temporary_file)
+  //  ftruncate(fd, 1024 * 1024);
   
   // 4 * 16384
   // 4 TB of virtual memory is enough to span all addresses we need.
@@ -66,7 +67,7 @@ func mainFunc() {
   // 0x0000001500018000
   let bitPattern = 0x0000001500018000 * 0b10000
   let desiredPointer = UnsafeMutableRawPointer(bitPattern: bitPattern)!
-  let actualPointer = mmap(desiredPointer, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED/*MAP_FIXED | MAP_ANONYMOUS*/, Int32(fd), 0);
+  let actualPointer = mmap(desiredPointer, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, Int32(-1), 0);
   precondition(actualPointer == desiredPointer, "\(actualPointer) \(desiredPointer) \(errno)")
   
   let chunkSize = 32768
@@ -94,13 +95,10 @@ func mainFunc() {
   successes.append(Allocation(bufferID: baseBufferID, gpuAddress: baseVA, length: 32768, cpuOffset: maxCPUOffset))
   maxCPUOffset += 32768
   
-  // Should print every time it retries, and the attempt number. Finally, print
-  // when it succeeds.
   func allocate(length: Int) -> Allocation {
-    // A more intelligent algorithm will understand the 32768-byte separation
-    // between most Metal allocations.
-    var currentOffset = maxCPUOffset
-    let (currentBufferID, currentVA) = allocBuffer(address: desiredPointer, offset: maxCPUOffset, length: length)
+    // On Apple GPUs, Metal allocations are typically off by 32768 bytes.
+    var currentOffset = maxCPUOffset + 32768
+    var (currentBufferID, currentVA) = allocBuffer(address: desiredPointer, offset: currentOffset, length: length)
     
     var numAttempts = 1
     var deltaCPU = currentOffset - baseCPUOffset
@@ -110,50 +108,48 @@ func mainFunc() {
       deallocBuffer(bufferID: currentBufferID, offset: currentOffset, length: length)
       
       currentOffset = (deltaGPU - deltaCPU) + currentOffset
-      
+      (currentBufferID, currentVA) = allocBuffer(address: desiredPointer, offset: currentOffset, length: length)
+      deltaCPU = currentOffset - baseCPUOffset
+      deltaGPU = Int(currentVA) - Int(baseVA)
       
       numAttempts += 1
-      if numAttempts >= 2 {
+      if numAttempts >= 3 {
         // debug breakpoint here
       }
-      
     }
-    print("It finally worked, after \(numAttempts) attempts.")
-// debug breakpoint here
-    // TODO: Adjust the max CPU offset so another allocation can know where
-    // to start. We don't know whether the current max is too high or too low.
-    // Also, we should worry about running out of GPU address space.
     
-    fatalError()
+    // Adjust the max CPU offset so another allocation can know where to start.
+    // We don't know whether the current max is too high or too low. Should we
+    // worry about running out of GPU address space?
+    maxCPUOffset = max(maxCPUOffset, currentOffset + length)
+    print("It finally worked, after \(numAttempts) attempts. \(OpaquePointer(bitPattern: deltaGPU) as Any)")
+    
+    return Allocation(bufferID: currentBufferID, gpuAddress: currentVA, length: length, cpuOffset: currentOffset)
   }
   
-  successes.append(allocate(length: 32768))
+  let scaleFactor = 256 // 8-16 GB
+  successes.append(allocate(length: 32768 * 1024 * scaleFactor))
+  successes.append(allocate(length: 65536 * 1024 * scaleFactor))
+  successes.append(allocate(length: 65536 * 1024 * scaleFactor))
+  successes.append(allocate(length: 32768 * 1024 * scaleFactor))
+  // [32768, 65536, 65536, 32768]
   
-  
-//  let gpuAddr1 = allocBuffer(address: desiredPointer + cpuOffset, length: chunkSize)
-//  cpuOffset += chunkSize
-//
-//  let gpuAddr2 = allocBuffer(address: desiredPointer + cpuOffset, length: chunkSize)
-//  print(Int(gpuAddr2) - Int(gpuAddr1) - chunkSize)
-//
-//  bufferCache.remove(at: 0)
-//
-//  cpuOffset += chunkSize
-//  let gpuAddr3 = allocBuffer(address: desiredPointer + cpuOffset, length: chunkSize)
-//  print(Int(gpuAddr3) - Int(gpuAddr1) - chunkSize)
-//  bufferCache.remove(at: 1)
-//
-//  do {
-//    let gpuAddr3 = allocBuffer(address: desiredPointer + cpuOffset, length: chunkSize)
-//    print(Int(gpuAddr3) - Int(gpuAddr1) - chunkSize)
-//  }
-  
-  
-  exit(0)
-  
-  // TODO: Compile CPU in both debug and release mode.
-  // TODO: Repeat multiple times to decrease overhead.
+  func remove(at index: Int) {
+    let alloc = successes.remove(at: index)
+    deallocBuffer(bufferID: alloc.bufferID, offset: alloc.cpuOffset, length: alloc.length)
+  }
+  remove(at: 4)
+  remove(at: 3)
+  remove(at: 2)
+  remove(at: 1)
+  successes.append(allocate(length: 32768 * 1024 * scaleFactor))
+  successes.append(allocate(length: 65536 * 1024 * scaleFactor))
+  successes.append(allocate(length: 65536 * 1024 * scaleFactor))
+  successes.append(allocate(length: 32768 * 1024 * scaleFactor))
+  // [32768, 65536, 65536, 32768]
+}
 
+func oldMainFunc2() {
   let device = MTLCreateSystemDefaultDevice()!
   let library = device.makeDefaultLibrary()!
   let function = library.makeFunction(name: "hostMessaging")!
