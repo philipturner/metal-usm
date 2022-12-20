@@ -9,6 +9,110 @@ import Metal
 import Atomics
 import MetalKit
 
+func mainFunc() {
+  defer { print("Execution finished.") }
+  
+  // Determining how many heaps you can pass into `useResource(_:usage:)`
+  // without causing too much driver overhead.
+  //
+  // Overhead is based solely on number of heap objects, not amount of memory.
+  // Number of heaps - encoding overhead - scheduling overhead
+  //     1 -    6 us -   32 us
+  //    16 -    6 us -   32 us
+  //    32 -    7 us -   37 us
+  //    64 -    8 us -   43 us
+  //   128 -    9 us -   54 us
+  //   256 -   11 us -   72 us
+  //   512 -   16 us -  117 us
+  //  1024 -   26 us -  49-210 us
+  //  2048 -   56 us -  72-372 us
+  //  4096 -  115 us -  542-717 us
+  //  8192 -  289 us -  300-833 us
+  // 16384 -  677 us -  747-1033 us
+  let numHeaps = 128
+  let heapSizeMin = 1024 * 1024 * 1024 / numHeaps
+  let heapSizeMax = heapSizeMin
+  let doUseResource = true
+  
+  // Initialize the context.
+  let device = MTLCreateSystemDefaultDevice()!
+  let library = device.makeDefaultLibrary()!
+  let function = library.makeFunction(name: "vectorAddition")!
+  let pipeline = try! device.makeComputePipelineState(function: function)
+  
+  // Initialize the heaps.
+  var heaps: [MTLHeap] = []
+  let heapDescriptor = MTLHeapDescriptor()
+  heapDescriptor.hazardTrackingMode = .tracked
+  heapDescriptor.storageMode = .private
+  for _ in 0..<numHeaps {
+    heapDescriptor.size = Int.random(in: heapSizeMin...heapSizeMax)
+    let heap = device.makeHeap(descriptor: heapDescriptor)!
+    heaps.append(heap)
+  }
+  
+  // Initialize the buffers.
+  let bufferLength = 1024 //1024
+//  precondition(device.maxBufferLength == bufferLength)
+  let bufferA = device.makeBuffer(
+    length: bufferLength, options: .storageModeShared)!
+  let bufferB = device.makeBuffer(
+    length: bufferLength, options: .storageModeShared)!
+  let bufferC = device.makeBuffer(
+    length: bufferLength, options: .storageModeShared)!
+  let bufferD = device.makeBuffer(
+    length: bufferLength, options: .storageModeShared)!
+  
+  let queue = device.makeCommandQueue()!
+  
+  var minEncodingOverhead: Int = 1_000_000
+  var minSchedulingOverhead: Int = 1_000_000
+  for _ in 0..<50 {
+    // Dispatch the command.
+    let encodeStart = CACurrentMediaTime()
+    let commandBuffer = queue.makeCommandBuffer()!
+    let encoder = commandBuffer.makeComputeCommandEncoder()!
+    encoder.setComputePipelineState(pipeline)
+    if doUseResource {
+      encoder.useHeaps(heaps)
+    }
+    encoder.setBuffer(bufferA, offset: 0, index: 0)
+    encoder.setBuffer(bufferB, offset: 0, index: 1)
+    encoder.setBuffer(bufferC, offset: 0, index: 2)
+    encoder.setBuffer(bufferD, offset: 0, index: 3)
+    
+    let numThreads =  bufferLength / 16
+    encoder.dispatchThreads(
+      MTLSizeMake(numThreads, 1, 1),
+      threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+    encoder.endEncoding()
+    commandBuffer.commit()
+    let encodeEnd = CACurrentMediaTime()
+    commandBuffer.waitUntilCompleted()
+    let waitEnd = CACurrentMediaTime()
+    
+    // Record various overheads.
+    let encodingTime = encodeEnd - encodeStart
+    let waitTime = waitEnd - encodeEnd
+    let schedulingTime = commandBuffer.kernelEndTime - commandBuffer.kernelStartTime
+    let executionTime = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+//    print()
+//    print("Encoding time: \(Int(encodingTime * 1e6)) us")
+//    print("Scheduling time: \(Int(schedulingTime * 1e6)) us")
+//    print("Execution time: \(Int(executionTime * 1e6)) us")
+//    print("Wait time: \(Int(waitTime * 1e6)) us")
+    
+    minEncodingOverhead = min(minEncodingOverhead, Int(encodingTime * 1e6))
+    minSchedulingOverhead = min(minSchedulingOverhead, Int(schedulingTime * 1e6))
+  }
+  
+  print()
+  print("Minimum encoding overhead: \(minEncodingOverhead) us")
+  print("Minimum scheduling overhead: \(minSchedulingOverhead) us")
+}
+
+
+
 let device = MTLCreateSystemDefaultDevice()!
 var rangeCache: [Range<Int>] = []
 var bufferCache: [Int: MTLBuffer] = [:]
@@ -36,8 +140,7 @@ func deallocBuffer(bufferID: Int, offset: Int, length: Int) {
   bufferCache[bufferID] = nil
 }
 
-func mainFunc() {
-  defer { print("Execution finished.") }
+func oldMainFunc3() {
   //  MAP_FIXED | MAP_ANONYMOUS
   //  PROT_READ | PROT_WRITE
   
