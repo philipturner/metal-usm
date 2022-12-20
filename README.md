@@ -45,7 +45,8 @@ Given that USM shared memory is enabled, the compiler will have to examine the p
 
 ## The Problem of `useResource(_:usage:)`
 
-> TL;DR - Both shared and device USM pointers will occur in the same address space. The CPU and GPU addresses will always be off by a constant integer, allowing easy translation. Furthermore, we don't need to statically allocate a large `MTLHeap` beforehand. We can scale from almost nothing to almost all device RAM.
+<details>
+<summary>Thoughts on the problem</summary>
 
 While debugging emulated 64-bit atomics, I learned something important about `MTLComputeCommandEncoder.useResource(_:usage:)`. If you don't call this function on an indirectly encoded resource, the GPU will freeze at runtime and force you to restart your computer. Or worse, it will keep running in the background while consuming 1/2 the TDP. One possible reason is, Metal shares CPU virtual memory that can be paged to the disk. The GPU maps that memory just before dispatching certain commands, then potentially unmaps it afterward. With USM pointers, we cannot know which memory to map beforehand.
 
@@ -58,3 +59,7 @@ While experimenting, I found a solution to the problem of limited heap memory. I
 I should update the rest of this draft to account for no limits on memory. The only limit is device RAM size. Devices can't be paged to disk because of `useResource(_:usage:)`. If I want SYCL accessors to be [transformable into USM pointers](https://hipsycl.github.io/hipsycl/extension/hipsycl-091-buffer-usm-interop/), there's no way to notify the `MTLComputeCommandEncoder` that they're being "used". Therefore, all memory in any form must originate from the ~32 GB of tracked memory. This brings up another problem. How do I divide such a massive address space into few enough `MTLHeap`s that I can call `useResource(_:usage:)` on every one during command encoding? I can take inspiration from PyTorch's MPS allocator, which allocates small Metal buffers from large Metal heaps. Alternatively, statically divide the device's RAM into fixed fractions. Some chunks are larger to accomodate large allocations, while smaller chunks lower the memory footprint of a small program.
 
 I did some more investigation into overhead of using heaps. The `useHeaps(_:)` function has overhead scaling linearly with number of heaps, not the amount of memory passed in. That means it doesn't look at each virtual memory page separately. 128 heaps increased overhead by ~50%, so we should set that as the default maximum (users should be able to adjust it). This will determine the size of heaps for small allocations in a PyTorch-like allocator. On my machine, `recommendedMaxWorkingSetSize / 128` equals 171 MB. We should round up the size to a power of 2, in this case 256 MB. On my iPhone with 4 GB of RAM accessible to any one app, it could be 32 MB. On an M1/M2 Ultra with 128 GB of working set, it would be 1 GB.
+
+</details>
+
+> TL;DR - Both shared and device USM pointers will occur in the same address space. The CPU and GPU addresses will always be off by a constant integer, allowing easy translation. Furthermore, we don't need to statically allocate a large `MTLHeap` beforehand. We can scale from almost nothing to almost all device RAM.
