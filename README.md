@@ -66,4 +66,4 @@ I did some more investigation into overhead of using heaps. The `useHeaps(_:)` f
 
 > TL;DR - Both shared and device USM pointers will occur in the same address space. The CPU and GPU addresses will always be off by a constant integer, allowing easy translation. Furthermore, we don't need to statically allocate a large `MTLHeap` beforehand. We can scale from almost nothing to almost all device RAM. 
 > 
-> We can also assign properties to certain partitions of the USM memory range, e.g. whether they're host-accessible. Thus, we can check whether a pointer is `shared` or `device` without tagging its upper 16 bits. Furthermore, all stray pointers can exist in the CPU address space. We no longer need to check a pointer's address space inside the GPU kernel.
+> We can also assign properties to certain partitions of the USM memory range, e.g. whether they're host-accessible. Thus, we can check whether a pointer is `shared` or `device` without tagging its upper 16 bits. Furthermore, all stray pointers can/must exist in their CPU form. We will no longer check a pointer's address space inside the GPU kernel.
