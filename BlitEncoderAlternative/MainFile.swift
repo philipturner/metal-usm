@@ -8,6 +8,11 @@
 import Metal
 import QuartzCore
 
+func mainFunc() {
+  validationTest()
+//  originalTest()
+}
+
 // Bandwidth variation with different parameters.
 // - Reference implementation 1: blit encoder, aligned
 // - Reference implementation 2: blit encoder, src_offset=2, dst_offset=289
@@ -30,15 +35,260 @@ import QuartzCore
 //  64 KB |    8 |   15 |   20 |   13 |   13 |   13 |   13 |   12 |   11 |
 //  16 KB |    7 |    4 |    5 |    3 |    3 |    3 |    3 |    3 |    3 |
 
-func mainFunc() {
-  // TODO: Validate that this copies correctly and without bugs.
-  // TODO: Gather wide range of data about SIMD-only blit.
-  // TODO: Make threadgroup enhancement reversible (compiler macro).
+// Thoroughly validates a wide range of edge cases, and times them. Compares to
+// the blit encoder. It can also disable the accelerated "copyBufferAligned"
+// fast-path.
+func validationTest() {
+  // Note that Metal Frame Capture and API validation are probably enabled.
+  let testingPerformance = false
+  let bufferSize = 256 * 1024
+  let numTrials = 15
   
+  let usingAlignedFastPath = false
+  let usingBlitEncoder = false
+  let forceUseCustomOffsets = true
+  
+  // Only used in performance testing mode.
+  #if true
+  let srcOffset = 128
+  let dstOffset = 128
+  var customBytesCopied: Int? = nil
+  
+  #else
+  let srcOffset = Int.random(in: 0..<16384)
+  let dstOffset = Int.random(in: 0..<16384)
+  var customBytesCopied: Int? = bufferSize - max(srcOffset, dstOffset)
+  customBytesCopied! -= Int.random(in: 0..<16384)
+  if testingPerformance {
+    print("Source offset: \(srcOffset)")
+    print("Destination offset: \(dstOffset)")
+    print("Bytes copied: \(customBytesCopied!)")
+  }
+  #endif
+  
+  let testStart = CACurrentMediaTime()
+  let device = MTLCreateSystemDefaultDevice()!
+  let commandQueue = device.makeCommandQueue()!
+  let library = device.makeDefaultLibrary()!
+  
+  var pipelines: [String: MTLComputePipelineState] = [:]
+  for name in ["copyBufferAligned", "copyBufferEdgeCases"] {
+    let desc = MTLComputePipelineDescriptor()
+    desc.computeFunction = library.makeFunction(name: name)!
+    desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = true
+    
+    let pipeline = try! device.makeComputePipelineState(
+      descriptor: desc, options: [], reflection: nil)
+    precondition(pipeline.maxTotalThreadsPerThreadgroup == 1024)
+    pipelines[name] = pipeline
+  }
+  
+  var bufferSrc = device.makeBuffer(length: bufferSize)!
+  var bufferDst = device.makeBuffer(length: bufferSize)!
+  var minCopyTime: Double = 1_000
+  var maxBandwidth: Double = 0
+  
+  let referenceSrc = malloc(bufferSize)!
+  let referenceDst = malloc(bufferSize)!
+  defer {
+    free(referenceSrc)
+    free(referenceDst)
+  }
+  if !testingPerformance {
+    // Only generate random numbers once, minimizing time wasted on the CPU.
+    let referenceSrcCasted = referenceSrc.assumingMemoryBound(to: Int.self)
+    for i in 0..<bufferSize / 8 {
+      // Logical or this with a mask, so that no single byte equals zero.
+      let randomInteger = Int.random(in: 0..<Int.max)
+      let mask = 0x0101010101010101
+      referenceSrcCasted[i] = randomInteger | mask
+    }
+  }
+  
+outer:
+  for _ in 0..<numTrials {
+    defer {
+      swap(&bufferSrc, &bufferDst)
+    }
+    
+    var thisSrcOffset: Int
+    var thisDstOffset: Int
+    var thisBytesCopied: Int
+    if testingPerformance || forceUseCustomOffsets {
+      thisSrcOffset = srcOffset
+      thisDstOffset = dstOffset
+      if let customBytesCopied = customBytesCopied {
+        thisBytesCopied = customBytesCopied
+      } else {
+        let maxOffset = max(thisSrcOffset, thisDstOffset)
+        thisBytesCopied = bufferSize - max(thisSrcOffset, thisDstOffset)
+      }
+    } else {
+      thisSrcOffset = Int.random(in: 0..<16384)
+      thisDstOffset = Int.random(in: 0..<16384)
+      thisBytesCopied = bufferSize - max(thisSrcOffset, thisDstOffset)
+      thisBytesCopied -= Int.random(in: 0..<16384)
+    }
+    precondition(thisSrcOffset >= 0)
+    precondition(thisDstOffset >= 0)
+    precondition(thisBytesCopied > 0)
+    
+    if !testingPerformance {
+      // Clear the destination buffer and reference destination.
+      memset(referenceDst, 0, bufferSize)
+      memset(bufferDst.contents(), 0, bufferSize)
+      
+      // Initialize the source buffer and simulate a correct memcpy.
+      memcpy(bufferSrc.contents(), referenceSrc, bufferSize)
+      memcpy(
+        referenceDst + thisDstOffset, referenceSrc + thisSrcOffset,
+        thisBytesCopied)
+    }
+    
+    // Encode GPU work.
+    let commandBuffer = commandQueue.makeCommandBuffer()!
+    if usingBlitEncoder {
+      let encoder = commandBuffer.makeBlitCommandEncoder()!
+      defer { encoder.endEncoding() }
+      encoder.copy(
+        from: bufferSrc, sourceOffset: thisSrcOffset, to: bufferDst,
+        destinationOffset: thisDstOffset, size: thisBytesCopied)
+    } else {
+      let encoder = commandBuffer.makeComputeCommandEncoder()!
+      defer { encoder.endEncoding() }
+      
+      var useFastPath = false
+      if usingAlignedFastPath {
+        if thisSrcOffset % 128 == 0 && thisDstOffset % 128 == 0 {
+          if thisBytesCopied % 4 == 0 {
+            useFastPath = true
+          }
+        }
+      }
+      
+      if useFastPath {
+        let pipeline = pipelines["copyBufferAligned"]!
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(bufferSrc, offset: thisSrcOffset, index: 0)
+        encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
+        encoder.dispatchThreads(
+          MTLSizeMake(thisBytesCopied / 4, 1, 1),
+          threadsPerThreadgroup: MTLSizeMake(32, 1, 1))
+      } else {
+        let pipeline = pipelines["copyBufferEdgeCases"]!
+        encoder.setComputePipelineState(pipeline)
+        
+        // Encode buffer bindings.
+        let srcTrueVA = bufferSrc.gpuAddress + UInt64(thisSrcOffset)
+        let dstTrueVA = bufferDst.gpuAddress + UInt64(thisDstOffset)
+        let src_base = srcTrueVA & ~(128 - 1)
+        let dst_base = dstTrueVA & ~(128 - 1)
+        let srcBaseOffset = Int(src_base - bufferSrc.gpuAddress)
+        let dstBaseOffset = Int(dst_base - bufferDst.gpuAddress)
+        encoder.setBuffer(bufferSrc, offset: srcBaseOffset, index: 0)
+        encoder.setBuffer(bufferDst, offset: dstBaseOffset, index: 1)
+        
+        // Encode dispatch arguments.
+        struct Arguments {
+          var src_start: UInt32 = 0
+          var src_end: UInt32 = 0
+          var dst_start: UInt32 = 0
+          var dst_end: UInt32 = 0
+          
+          var word_realignment: Int16 = 0
+          var bytes_after_word_realignment: UInt16 = 0
+          
+          var dst_start_distance: UInt16 = 0
+          var dst_end_distance: UInt16 = 0
+        }
+        var arguments = Arguments()
+        let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
+        let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
+        arguments.src_start = .init((srcTrueVA - src_base) / 4)
+        arguments.src_end = .init((srcEndVA - src_base) / 4)
+        arguments.dst_start = .init((dstTrueVA - dst_base) / 4)
+        arguments.dst_end = .init((dstEndVA - dst_base) / 4)
+        
+        let absolute_realignment = Int(dstTrueVA % 128) - Int(srcTrueVA % 128)
+        let word_realignment = (absolute_realignment + 128) / 4 - 32
+        arguments.word_realignment = Int16(word_realignment)
+        arguments.bytes_after_word_realignment =
+          UInt16(absolute_realignment - 4 * word_realignment)
+        precondition(word_realignment * 4 <= absolute_realignment)
+        
+        arguments.dst_start_distance = .init((dstTrueVA - dst_base) % 4)
+        arguments.dst_end_distance = .init((dstEndVA - dst_base) % 4)
+        
+        let argumentsSize = MemoryLayout<Arguments>.stride
+        encoder.setBytes(&arguments, length: argumentsSize, index: 2)
+        
+        // Dispatch correct amount of threads.
+        // TODO: -
+        
+        fatalError("Slow path not yet implemented.")
+      }
+    }
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+    
+    if testingPerformance {
+      // Update `minCopyTime` and `maxBandwidth`.
+      // Bandwidth should report the actual bytes transferred.
+      let time = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+      let bandwidth = Double(2 * thisBytesCopied) / time
+      if bandwidth > maxBandwidth {
+        maxBandwidth = bandwidth
+        minCopyTime = time
+      }
+    } else {
+      // Validate that results are correct. Otherwise, print how it failed.
+      let error = memcmp(referenceDst, bufferDst.contents(), bufferSize)
+      if error != 0 {
+        print("Failed with:")
+        print("Source offset: \(thisSrcOffset)")
+        print("Destination offset: \(thisDstOffset)")
+        print("Bytes copied: \(thisBytesCopied)")
+        
+        let referenceDstCasted = referenceDst
+          .assumingMemoryBound(to: SIMD4<UInt8>.self)
+        let bufferDstCasted = bufferDst
+          .contents().assumingMemoryBound(to: SIMD4<UInt8>.self)
+        var numFailures = 0
+        
+        for i in 0..<bufferSize / 4 {
+          let referenceElement = referenceDstCasted[i]
+          let bufferElement = bufferDstCasted[i]
+          if any(referenceElement .!= bufferElement) {
+            let dataString = "ref [\(referenceElement[0]), \(referenceElement[1]), \(referenceElement[2]), \(referenceElement[3])] != buf [\(bufferElement[0]), \(bufferElement[1]), \(bufferElement[2]), \(bufferElement[3])]"
+            print("Word \(i) (bytes \(i * 4)...\(i * 4 + 3)): \(dataString)")
+            numFailures += 1
+          }
+          if numFailures >= 5 {
+            print("Too many failures, quitting now.")
+            break outer
+          }
+        }
+      }
+    }
+  }
+  
+  if testingPerformance {
+    // Print copying time (us) and bandwidth.
+    print("Copy Time: \(Int(minCopyTime * 1e6)) us")
+    print("Bandwidth: \(Int(maxBandwidth / 1e9)) GB/s")
+  }
+  
+  let testEnd = CACurrentMediaTime()
+  let millis = String(format: "%.3f", testEnd - testStart)
+  print("Elapsed time: \(millis) ms")
+}
+
+// Original testing function.
+func originalTest() {
   // Constants to change program execution.
   let usingBlitEncoder = true
   let usingAlignedBlit = true
-  let bufferSize = 16 * 1024 * 1024
+  let bufferSize = 265 * 1024
   let numTrials = 15
   let byteOffset1 = 12
   let byteOffset2 = 17
