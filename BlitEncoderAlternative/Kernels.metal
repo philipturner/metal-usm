@@ -9,17 +9,27 @@
 using namespace metal;
 
 // Scans multi-GB chunks of memory at once.
-// Loads with 32-bit resolution (first/last words treated specially).
+// Loads with 1024-bit resolution (first/last chunks treated specially).
 // Unaligned data transferred through threadgroup memory and/or SIMD shuffles.
 // After realignment, start writing to RAM.
 struct Arguments {
+  // Offset in 32-bit words, rounded down.
   uint src_start;
   uint src_end;
   uint dst_start;
   uint dst_end;
   
-  // Offset in 32-bit words, rounded down.
-  // TODO: Reassociated variable accesses to the new names.
+  // Parameters for realigning 1024-bit transactions across the threadgroup.
+  // Realignment is the delta (modulo 32) between dst - src addresses.
+  // Keep word realignment signed, toward either the floor or ceiling.
+  // -16 <= word_realignment < 16
+  short word_realignment;
+  ushort bytes_after_word_realignment;
+  
+  // How much data must transfer?
+  // To minimize shader complexity, assume byte_alignment > 0.
+  // abs(args.word_realignment) + select(0, 1, args.word_realignment >= 0)
+  ushort transfers_per_simd;
   
   // Real offset, in bytes after word offset.
   ushort src_start_distance;
@@ -28,24 +38,14 @@ struct Arguments {
   ushort dst_end_distance;
 };
 
-// First try with just SIMD shuffles, then enhance with threadgroup memory.
-// Simds per threadgroup: 8 + 1 + 1
+// `src_base` and `dst_base` are rounded to 1024-bit chunks.
+// Allowed arithmetic intensity: 5308/(408/4/2) = 104 cycles/word copied.
 //
-// Middle simds handle contiguous chunks (cheap).
-// Outer simds handle unaligned addresses (expensive).
-// Still 8-9 threadgroups/grid, 64-72 active simds.
-//
-// For outer simds:
-// - First, aligned-write the contiguous words (masked by thread).
-// - Then, subdivide bytes from the remaining word across threads.
-//
-// This scheme decreases average arithmetic intensity by ~80%.
-// - Allowed cycles/unaligned byte: ~13
-// - Allowed cycles/32-bit word: ~52
-
-// `src_base` and `dst_base` rounded to 4096-byte pages.
-// TODO: Properly align the grid, so you don't read out-of-bounds and cause a
-// page fault.
+// Assuming 16x4 banks with 1-cycle throughput, threadgroup memory supports
+// ~2654 GB/s or ~664 GW/s. Instruction throughput is 5308 GI/s. If most
+// threadgroup accesses can happen instead through 4 SIMD shuffles or 8 1-cycle
+// arithmetic instructions, it'll be faster. A hybrid approach that minimizes
+// threadgroup bandwidth can also help.
 kernel void copyBufferEdgeCases
  (
   device uchar4 *src_base [[buffer(0)]],
@@ -59,6 +59,53 @@ kernel void copyBufferEdgeCases
   ushort simd_index [[simdgroup_index_in_threadgroup]],
   ushort lane_id [[thread_index_in_simdgroup]])
 {
+  uchar4 src_data;
+  if (tid <= args.src_end) {
+    // Read through the rounded-down end, inclusive.
+    src_data = src_base[tid];
+  } else {
+    // Don't read outside page boundaries; you'll cause a soft fault.
+  }
+  
+  // Slightly extend the memory, so that different threadgroups start at
+  // different offsets. Not sure whether M1 has 16 or 32 banks, but doubling the
+  // extra space should be harmless.
+  constexpr int padding = 32;
+  constexpr int max_transfers_per_simd = 16;
+  constexpr int simds_per_threadgroup = 8;
+  constexpr int words_per_allocation =
+    max_transfers_per_simd * simds_per_threadgroup + padding;
+  
+  threadgroup uchar4 transferred_words[words_per_allocation];
+  uchar4 realigned_word_lo;
+  uchar4 realigned_word_hi;
+  
+  // Okay to read out-of-bounds, but not to write out-of-bounds. Avoid excessive
+  // reads unless it's a fraction of total threadgroup bandwidth.
+  ushort simd_transfer_base_index =
+    tgid % padding + args.transfers_per_simd * simd_index;
+  
+  // Duplicate the instructions for each case; too costly to unify.
+  if (args.word_realignment >= 0) {
+    // TODO: After finishing this section, wrap it inside macros.
+    
+    // MARK: - Write to threadgroup memory
+    
+    
+    
+    // MARK: - Shuffle what you can between lanes
+    
+    
+    // MARK: - Barrier, read from threadgroup memory
+    
+    
+    // MARK: - Shuffle some more
+  } else {
+    
+  }
+
+  
+#if false
   // TODO: When using threadgroups, realign not just on word boundaries. Also
   // realign on memory transaction boundaries (128 bytes). In copyBufferAligned,
   // check whether odd multiples of 4 tank performance.
@@ -217,6 +264,8 @@ kernel void copyBufferEdgeCases
   } else {
     
   }
+  
+#endif
 }
 
 kernel void copyBufferAligned
