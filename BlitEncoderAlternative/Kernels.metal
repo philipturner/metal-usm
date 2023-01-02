@@ -47,6 +47,9 @@ struct Arguments {
   //   absolute_realignment - 4 * word_realignment
   short word_realignment;
   ushort bytes_after_word_realignment;
+  
+  // word_realignment & ~(transaction_words - 1)
+  short word_rounded_realignment;
 };
 
 __attribute__((__always_inline__))
@@ -67,10 +70,15 @@ uchar4 combine_data(uchar4 lo, uchar4 hi, ushort byte_realignment) {
   }
 }
 
-constant bool using_threadgroups = false;
-constant ushort num_active_threads = 32 * 8;
+constant bool using_threadgroups = true;
+constant ushort num_active_threads = 32 * 7;
 constant ushort transaction_bytes = 128;
 constant ushort transaction_words = transaction_bytes / 4;
+
+// This function routinely reads out-of-bounds, causing superfluous errors in
+// Metal Shader Validation. This constant activates bounds checking in shader
+// code, with a slight performance penalty.
+constant bool use_shader_validation [[function_constant(0)]];
 
 // `src_base` and `dst_base` are rounded to 1024-bit chunks.
 // Allowed arithmetic intensity: 5308/(408/4/2) = 104 cycles/word copied.
@@ -84,67 +92,61 @@ kernel void copyBufferEdgeCases
   
   // Threadgroup size assumed to be 256 + 32.
   // Simdgroup size assumed to be 32.
+  uint tid [[thread_position_in_grid]],
   uint tgid [[threadgroup_position_in_grid]],
   ushort thread_index [[thread_position_in_threadgroup]],
-  ushort simd_index [[simdgroup_index_in_threadgroup]],
   ushort lane_id [[thread_index_in_simdgroup]])
 {
   uchar4 lo, hi;
   uint dst_index;
-//  if (using_threadgroups) {
-//    int absolute_start = tgid * num_active_threads;
-//    int read_start = absolute_start + args.word_realignment;
-//    int read_group_base = read_start & ~(transaction_words - 1);
-//    int src_index = read_group_base + thread_index;
-//
-//    // Don't read out of bounds, you may cause a soft fault or harm bandwidth.
-//    int ram_index = src_index;
-//    ram_index = max(ram_index, int(args.src_start));
-//    ram_index = min(ram_index, int(args.src_end));
-//    ram_index = max(ram_index, read_start);
-//    ram_index = min(ram_index, read_start + num_active_threads);
-//    uchar4 src_data = src_base[ram_index];
-//
-//    // Transfer contiguous chunks to threadgroup memory.
-//    threadgroup uchar4 transferred_words[transaction_words + num_active_threads + transaction_words];
-//    transferred_words[src_index - absolute_start + transaction_words] = src_data;
-//    if (simd_index == num_active_threads / 32) {
-//      // We don't need the last simd anymore.
-//      return;
-//    }
-//
-//    // Realign the data.
-//    short tg_base_index = thread_index + args.word_realignment;
-//    threadgroup_barrier(mem_flags::mem_threadgroup);
-//    lo = transferred_words[tg_base_index + transaction_words];
-//    hi = transferred_words[tg_base_index + transaction_words + 1];
-//    dst_index = absolute_start + thread_index;
-//  } else {
-    int absolute_start = tgid * 256 + simd_index * 32;
-    int read_start = absolute_start + args.word_realignment;
-    int read_group_base = read_start & ~(transaction_words - 1);
-    int src_index = read_group_base + lane_id;
-    
-    // Do not read out-of-bounds. That could cause a soft fault or create
-    // errors in Metal Shader Validation.
+  if (using_threadgroups) {
+    int start = tgid * num_active_threads;
+    int src_index = start + args.word_rounded_realignment + thread_index;
+
+    // Don't read out of bounds, you may cause a soft fault or harm bandwidth.
+    if (use_shader_validation) {
+      src_index = max(src_index, int(args.src_start));
+      src_index = min(src_index, int(args.src_end));
+    }
+    uchar4 src_data = src_base[src_index];
+
+    // Transfer contiguous chunks to threadgroup memory.
+    threadgroup uchar4 transferred_words[
+      transaction_words + num_active_threads + transaction_words];
+    short tg_write_index = args.word_rounded_realignment + thread_index;
+    transferred_words[transaction_words + tg_write_index] = src_data;
+    if (thread_index >= num_active_threads) {
+      // We don't need the last simd anymore.
+      return;
+    }
+
+    // Realign the data.
+    short tg_read_index = args.word_realignment + thread_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    lo = transferred_words[transaction_words + tg_read_index];
+    hi = transferred_words[transaction_words + tg_read_index + 1];
+    dst_index = start + thread_index;
+  } else {
+    int src_index = int(args.word_rounded_realignment) + tid;
     int ram_index_lo = src_index;
     int ram_index_hi = src_index + 32;
     
-    // TODO: Wrap this in an indirect command buffer. The first and last
-    // X threadgroups run a different set of shader code.
-    // Or, load this with a function constant, checking MTL_SHADER_VALIDATION
+    // TODO: Load this with a function constant, checking MTL_SHADER_VALIDATION
     // in the environment variables.
-//    if (ram_index_hi >= int(args.src_end)) {
-//      int upper_bound =
-//        int(args.src_end) - select(1, 0, args.src_end_distance > 0);
-//      ram_index_lo = min(ram_index_lo, upper_bound);
-//      ram_index_hi = min(ram_index_hi, upper_bound);
-//    }
-//    if (ram_index_lo < int(args.src_start)) {
-//      ram_index_lo = max(ram_index_lo, int(args.src_start));
-//      ram_index_hi = max(ram_index_hi, int(args.src_start));
-//    }
-    
+#if false
+    // Do not read out-of-bounds. That could cause a soft fault or create
+    // errors in Metal Shader Validation.
+    if (ram_index_hi >= int(args.src_end)) {
+      int upper_bound =
+        int(args.src_end) - select(1, 0, args.src_end_distance > 0);
+      ram_index_lo = min(ram_index_lo, upper_bound);
+      ram_index_hi = min(ram_index_hi, upper_bound);
+    }
+    if (ram_index_lo < int(args.src_start)) {
+      ram_index_lo = max(ram_index_lo, int(args.src_start));
+      ram_index_hi = max(ram_index_hi, int(args.src_start));
+    }
+#endif
     uchar4 src_data_lo = src_base[ram_index_lo];
     uchar4 src_data_hi = src_base[ram_index_hi];
     
@@ -155,8 +157,8 @@ kernel void copyBufferEdgeCases
       ? src_data_hi : src_data_lo;
     lo = simd_shuffle_rotate_down(served_lo, args.word_realignment);
     hi = simd_shuffle_rotate_down(served_hi, args.word_realignment + 1);
-    dst_index = absolute_start + lane_id;
-//  }
+    dst_index = tid;
+  }
   uchar4 data = combine_data(lo, hi, args.bytes_after_word_realignment);
   
   // Mask the write, checking both upper and lower bounds.
