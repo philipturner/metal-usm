@@ -40,19 +40,60 @@ func mainFunc() {
 // fast-path.
 func validationTest() {
   // Note that Metal Frame Capture and API validation are probably enabled.
-  let testingPerformance = false
-  let bufferSize = 256 * 1024
+  let testingPerformance = false//true
+  let bufferSize = 256 * 1024// 64 * 1024 * 1024
   let numTrials = 15
+  let numActiveThreads = 32 * 8
+  let transactionBytes = 128
+  let transactionWords = transactionBytes / 4
+  let usingThreadgroups = false
   
   let usingAlignedFastPath = false
   let usingBlitEncoder = false
-  let forceUseCustomOffsets = true
+  let forceUseCustomOffsets = false
+  let generateRepeatingPattern = false
+  let printArguments = false
+  
+  let isAligned = false
+  let srcOffset = isAligned ? 128 : 2
+  let dstOffset = isAligned ? 128 : 289
+  var customBytesCopied: Int? = nil
+  
+  // 156 - 195
+  
+  // Size = 256 KB A
+  // Blit:            48 GB/s
+  // Fast path:       44 GB/s
+  // 224/256 threads: 32 GB/s
+  // 256/288 threads: 32 GB/s
+  // 224/256 64 B:    27 GB/s
+  // 256/288 64 B:    27 GB/s
+  
+  // Size = 256 KB U
+  // Blit:            53 GB/s
+  // 224/256 threads: 32 GB/s
+  // 256/288 threads: 32 GB/s
+  // 224/256 64 B:    27 GB/s
+  // 256/288 64 B:    28 GB/s
+  
+  // Size = 64 MB A
+  // Blit:                  324 GB/s
+  // Fast Path:             325 GB/s
+  // 224/256 threads: 165 - 206 GB/s ???
+  // 256/288 threads: 159 - 198 GB/s ???
+  // 224/256 64 B:    163 - 193 GB/s ???
+  // 256/288 64 B:    157 - 188 GB/s ???
+  
+  // Size = 64 MB U
+  // Blit:            186 - 219 GB/s
+  // 224/256 threads: 156 - 195 GB/s
+  // 256/288 threads: 155 - 194 GB/s
+  // 224/256 64 B:    159 - 190 GB/s ???
+  // 256/288 64 B:    153 - 188 GB/s ???
   
   // Only used in performance testing mode.
   #if true
-  let srcOffset = 128
-  let dstOffset = 128
-  var customBytesCopied: Int? = nil
+  
   
   #else
   let srcOffset = Int.random(in: 0..<16384)
@@ -96,12 +137,19 @@ func validationTest() {
   }
   if !testingPerformance {
     // Only generate random numbers once, minimizing time wasted on the CPU.
-    let referenceSrcCasted = referenceSrc.assumingMemoryBound(to: Int.self)
-    for i in 0..<bufferSize / 8 {
-      // Logical or this with a mask, so that no single byte equals zero.
-      let randomInteger = Int.random(in: 0..<Int.max)
-      let mask = 0x0101010101010101
-      referenceSrcCasted[i] = randomInteger | mask
+    if generateRepeatingPattern {
+      let referenceSrcCasted = referenceSrc.assumingMemoryBound(to: UInt8.self)
+      for i in 0..<bufferSize {
+        referenceSrcCasted[i] = UInt8(truncatingIfNeeded: i % 256)
+      }
+    } else {
+      let referenceSrcCasted = referenceSrc.assumingMemoryBound(to: Int.self)
+      for i in 0..<bufferSize / 8 {
+        // Logical or this with a mask, so that no single byte equals zero.
+        let randomInteger = Int.random(in: 0..<Int.max)
+        let mask = 0x0101010101010101
+        referenceSrcCasted[i] = randomInteger | mask
+      }
     }
   }
   
@@ -120,7 +168,6 @@ outer:
       if let customBytesCopied = customBytesCopied {
         thisBytesCopied = customBytesCopied
       } else {
-        let maxOffset = max(thisSrcOffset, thisDstOffset)
         thisBytesCopied = bufferSize - max(thisSrcOffset, thisDstOffset)
       }
     } else {
@@ -159,7 +206,7 @@ outer:
       
       var useFastPath = false
       if usingAlignedFastPath {
-        if thisSrcOffset % 128 == 0 && thisDstOffset % 128 == 0 {
+        if thisSrcOffset % 64 == 0 && thisDstOffset % 64 == 0 {
           if thisBytesCopied % 4 == 0 {
             useFastPath = true
           }
@@ -173,7 +220,7 @@ outer:
         encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
         encoder.dispatchThreads(
           MTLSizeMake(thisBytesCopied / 4, 1, 1),
-          threadsPerThreadgroup: MTLSizeMake(32, 1, 1))
+          threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
       } else {
         let pipeline = pipelines["copyBufferEdgeCases"]!
         encoder.setComputePipelineState(pipeline)
@@ -181,51 +228,97 @@ outer:
         // Encode buffer bindings.
         let srcTrueVA = bufferSrc.gpuAddress + UInt64(thisSrcOffset)
         let dstTrueVA = bufferDst.gpuAddress + UInt64(thisDstOffset)
-        let src_base = srcTrueVA & ~(128 - 1)
-        let dst_base = dstTrueVA & ~(128 - 1)
+        let src_base = srcTrueVA & ~UInt64(transactionBytes - 1)
+        let dst_base = dstTrueVA & ~UInt64(transactionBytes - 1)
         let srcBaseOffset = Int(src_base - bufferSrc.gpuAddress)
         let dstBaseOffset = Int(dst_base - bufferDst.gpuAddress)
         encoder.setBuffer(bufferSrc, offset: srcBaseOffset, index: 0)
         encoder.setBuffer(bufferDst, offset: dstBaseOffset, index: 1)
         
+        precondition(bufferSrc.gpuAddress % UInt64(transactionBytes) == 0)
+        precondition(bufferDst.gpuAddress % UInt64(transactionBytes) == 0)
+        precondition(src_base % UInt64(transactionBytes) == 0)
+        precondition(dst_base % UInt64(transactionBytes) == 0)
+        
         // Encode dispatch arguments.
         struct Arguments {
           var src_start: UInt32 = 0
-          var src_end: UInt32 = 0
           var dst_start: UInt32 = 0
+          var src_end: UInt32 = 0
           var dst_end: UInt32 = 0
+          
+          var src_start_distance: UInt16 = 0
+          var dst_start_distance: UInt16 = 0
+          var src_end_distance: UInt16 = 0
+          var dst_end_distance: UInt16 = 0
           
           var word_realignment: Int16 = 0
           var bytes_after_word_realignment: UInt16 = 0
-          
-          var dst_start_distance: UInt16 = 0
-          var dst_end_distance: UInt16 = 0
         }
         var arguments = Arguments()
         let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
         let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
-        arguments.src_start = .init((srcTrueVA - src_base) / 4)
-        arguments.src_end = .init((srcEndVA - src_base) / 4)
-        arguments.dst_start = .init((dstTrueVA - dst_base) / 4)
-        arguments.dst_end = .init((dstEndVA - dst_base) / 4)
         
-        let absolute_realignment = Int(dstTrueVA % 128) - Int(srcTrueVA % 128)
-        let word_realignment = (absolute_realignment + 128) / 4 - 32
+        // This is rounded down.
+        let srcStartDelta = Int(srcTrueVA) - Int(src_base)
+        let dstStartDelta = Int(dstTrueVA) - Int(dst_base)
+        arguments.src_start = .init(srcStartDelta / 4)
+        arguments.dst_start = .init(dstStartDelta / 4)
+        
+        // This is rounded up.
+        let srcEndDelta = Int(srcEndVA) - Int(src_base)
+        let dstEndDelta = Int(dstEndVA) - Int(dst_base)
+        arguments.src_end = .init(srcEndDelta / 4)
+        arguments.dst_end = .init(dstEndDelta / 4)
+        
+        arguments.src_start_distance =
+          .init(srcStartDelta - 4 * Int(arguments.src_start))
+        arguments.dst_start_distance =
+          .init(dstStartDelta - 4 * Int(arguments.dst_start))
+        arguments.src_end_distance =
+          .init(srcEndDelta - 4 * Int(arguments.src_end))
+        arguments.dst_end_distance =
+          .init(dstEndDelta - 4 * Int(arguments.dst_end))
+        
+        let absolute_realignment = Int(srcTrueVA % UInt64(transactionBytes)) - Int(dstTrueVA % UInt64(transactionBytes))
+        let word_realignment = (absolute_realignment + transactionBytes) / 4 - transactionBytes / 4
         arguments.word_realignment = Int16(word_realignment)
         arguments.bytes_after_word_realignment =
-          UInt16(absolute_realignment - 4 * word_realignment)
+          .init(absolute_realignment - 4 * word_realignment)
         precondition(word_realignment * 4 <= absolute_realignment)
         
-        arguments.dst_start_distance = .init((dstTrueVA - dst_base) % 4)
-        arguments.dst_end_distance = .init((dstEndVA - dst_base) % 4)
-        
         let argumentsSize = MemoryLayout<Arguments>.stride
+        precondition(argumentsSize == 28)
         encoder.setBytes(&arguments, length: argumentsSize, index: 2)
+        if printArguments {
+          print(arguments)
+        }
         
         // Dispatch correct amount of threads.
-        // TODO: -
+        let _thisBytesCopied = UInt64(thisBytesCopied)
+        var srcUpperChunkBoundary = srcTrueVA + _thisBytesCopied - 1
+        var dstUpperChunkBoundary = dstTrueVA + _thisBytesCopied - 1
+        srcUpperChunkBoundary = srcUpperChunkBoundary & ~(UInt64(transactionBytes) - 1) + UInt64(transactionBytes)
+        dstUpperChunkBoundary = dstUpperChunkBoundary & ~(UInt64(transactionBytes) - 1) + UInt64(transactionBytes)
         
-        fatalError("Slow path not yet implemented.")
+        let dstScannedBytes = Int(dstUpperChunkBoundary - dst_base)
+        let numWords = dstScannedBytes / 4
+        let numChunks = numWords / transactionWords
+        if usingThreadgroups {
+          let numActiveSimds = numActiveThreads / 32
+          let numChunksRoundedUp =
+            (numChunks + numActiveSimds - 1) / numActiveSimds * numActiveSimds
+          let numThreadgroups = numChunksRoundedUp / numActiveSimds
+          encoder.dispatchThreadgroups(
+            MTLSizeMake(numThreadgroups, 1, 1),
+            threadsPerThreadgroup: MTLSizeMake(numActiveThreads + 32, 1, 1))
+        } else {
+          let numThreadgroups = (numChunks + 8 - 1) / 8
+          encoder.dispatchThreadgroups(
+            MTLSizeMake(numThreadgroups, 1, 1),
+            threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
+        }
+        
       }
     }
     commandBuffer.commit()
@@ -279,19 +372,19 @@ outer:
   }
   
   let testEnd = CACurrentMediaTime()
-  let millis = String(format: "%.3f", testEnd - testStart)
-  print("Elapsed time: \(millis) ms")
+  let seconds = String(format: "%.3f", testEnd - testStart)
+  print("Elapsed time: \(seconds) s")
 }
 
 // Original testing function.
 func originalTest() {
   // Constants to change program execution.
-  let usingBlitEncoder = true
+  let usingBlitEncoder = false
   let usingAlignedBlit = true
-  let bufferSize = 265 * 1024
+  let bufferSize = 256 * 1024
   let numTrials = 15
-  let byteOffset1 = 12
-  let byteOffset2 = 17
+  let byteOffset1 = 0
+  let byteOffset2 = 0
   let byteOffsetMax = max(byteOffset1, byteOffset2)
   
   // Initialize basic resources.
