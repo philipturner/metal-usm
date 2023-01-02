@@ -40,13 +40,13 @@ func mainFunc() {
 // fast-path.
 func validationTest() {
   // Note that Metal Frame Capture and API validation are probably enabled.
-  let testingPerformance = false//true
-  let bufferSize = 256 * 1024// 64 * 1024 * 1024
+  let testingPerformance = true
+  let bufferSize = 64 * 1024 * 1024
   let numTrials = 15
-  let numActiveThreads = 32 * 8
+  let numActiveThreads = 32 * 7
   let transactionBytes = 128
   let transactionWords = transactionBytes / 4
-  let usingThreadgroups = false
+  let usingThreadgroups = true
   
   let usingAlignedFastPath = false
   let usingBlitEncoder = false
@@ -114,8 +114,13 @@ func validationTest() {
   
   var pipelines: [String: MTLComputePipelineState] = [:]
   for name in ["copyBufferAligned", "copyBufferEdgeCases"] {
+    let constants = MTLFunctionConstantValues()
+    var use_shader_validation: Bool = false
+    constants.setConstantValue(&use_shader_validation, type: .bool, index: 0)
+    
     let desc = MTLComputePipelineDescriptor()
-    desc.computeFunction = library.makeFunction(name: name)!
+    desc.computeFunction = try! library.makeFunction(
+      name: name, constantValues: constants)
     desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = true
     
     let pipeline = try! device.makeComputePipelineState(
@@ -254,6 +259,7 @@ outer:
           
           var word_realignment: Int16 = 0
           var bytes_after_word_realignment: UInt16 = 0
+          var word_rounded_realignment: Int16 = 0
         }
         var arguments = Arguments()
         let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
@@ -285,10 +291,12 @@ outer:
         arguments.word_realignment = Int16(word_realignment)
         arguments.bytes_after_word_realignment =
           .init(absolute_realignment - 4 * word_realignment)
+        arguments.word_rounded_realignment =
+          arguments.word_realignment & ~Int16(transactionWords - 1)
         precondition(word_realignment * 4 <= absolute_realignment)
         
         let argumentsSize = MemoryLayout<Arguments>.stride
-        precondition(argumentsSize == 28)
+        precondition(argumentsSize == 32)
         encoder.setBytes(&arguments, length: argumentsSize, index: 2)
         if printArguments {
           print(arguments)
