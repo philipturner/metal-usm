@@ -35,66 +35,60 @@ func mainFunc() {
 //  64 KB |    8 |   15 |   20 |   13 |   13 |   13 |   13 |   12 |   11 |
 //  16 KB |    7 |    4 |    5 |    3 |    3 |    3 |    3 |    3 |    3 |
 
+// New statistics, after creating the optimized blit encoder alternative.
+// The overhead of it being a compute pipeline (rather than a presumably
+// built-in function) may harm device-side sequential throughput (+3 us). This
+// is amortized with multiple commands/encoder, and the custom version becomes
+// faster at 4 commands/encoder.
+//
+// A = (128, 128)-byte offset
+// B = ( 16,  64)-byte offset
+// C = (  4,  32)-byte offset
+// D = (  2, 289)-byte offset
+// E = ( 55, 289)-byte offset
+//
+//   Size | RefA : CusA | RefB : CusB | RefC : CusC | RefD : CusD | RefE : CusE
+// 256 MB |  375 :  375 |  376 :  376 |  376 :  376 |  329 :  376 |  376 :  376
+//  64 MB |  325 :  325 |  321 :  322 |  315 :  313 |  219 :  310 |  302 :  309
+//  16 MB |  300 :  299 |  298 :  297 |  299 :  284 |  182 :  279 |  294 :  278
+//   4 MB |  223 :  217 |  221 :  216 |  230 :  206 |  154 :  193 |  229 :  193
+//   1 MB |  126 :  105 |  125 :  106 |  125 :  103 |   96 :   89 |  125 :   89
+// 256 KB |   48 :   44 |   48 :   44 |   62 :   44 |   53 :   35 |   59 :   35
+//
+// Reference reuses the same blit encoder for every command. Custom reuses the
+// same compute encoder, with the custom kernel. Although 4 KB statistics are
+// rounded off, CusA takes consistently less microseconds of copy time (with
+// several repeats).
+//
+//           2 Repeats     4 Repeats     8 Repeats    32 Repeats    128 Repeats
+//   Size | RefA : CusA | RefA : CusA | RefA : CusA | RefA : CusA | RefA : CusA
+//   4 MB |  228 :  231 |  232 :  240 |  233 :  241 |  312 :  281 |  365 :  366
+//   1 MB |  132 :  120 |  136 :  130 |  137 :  136 |  139 :  136 |  229 :  217
+// 256 KB |   52 :   55 |   54 :   64 |   54 :   69 |   55 :   73 |   65 :   67
+//  64 KB |   17 :   17 |   18 :   21 |   18 :   24 |   18 :   26 |   18 :   27
+//  16 KB |    5 :    4 |    5 :    5 |    5 :    6 |    5 :    7 |    5 :    7
+//   4 KB |    1 :    1 |    1 :    1 |    1 :    1 |    1 :    1 |    1 :    1
+
 // Thoroughly validates a wide range of edge cases, and times them. Compares to
-// the blit encoder. It can also disable the accelerated "copyBufferAligned"
-// fast-path.
+// the blit encoder. It can also disable the "copyBufferAligned" fast-path.
 func validationTest() {
-  // Note that Metal Frame Capture and API validation are probably enabled.
   let testingPerformance = true
-  let bufferSize = 64 * 1024 * 1024
+  let bufferSize = testingPerformance ? 16 * 1024 : 256 * 1024
   let numTrials = 15
-  let numActiveThreads = 32 * 7
-  let transactionBytes = 128
-  let transactionWords = transactionBytes / 4
-  let usingThreadgroups = true
+  let numRepetitions = 128
   
-  let usingAlignedFastPath = false
+  let usingAlignedFastPath = true
   let usingBlitEncoder = false
   let forceUseCustomOffsets = false
   let generateRepeatingPattern = false
   let printArguments = false
   
-  let isAligned = false
-  let srcOffset = isAligned ? 128 : 2
-  let dstOffset = isAligned ? 128 : 289
-  var customBytesCopied: Int? = nil
-  
-  // 156 - 195
-  
-  // Size = 256 KB A
-  // Blit:            48 GB/s
-  // Fast path:       44 GB/s
-  // 224/256 threads: 32 GB/s
-  // 256/288 threads: 32 GB/s
-  // 224/256 64 B:    27 GB/s
-  // 256/288 64 B:    27 GB/s
-  
-  // Size = 256 KB U
-  // Blit:            53 GB/s
-  // 224/256 threads: 32 GB/s
-  // 256/288 threads: 32 GB/s
-  // 224/256 64 B:    27 GB/s
-  // 256/288 64 B:    28 GB/s
-  
-  // Size = 64 MB A
-  // Blit:                  324 GB/s
-  // Fast Path:             325 GB/s
-  // 224/256 threads: 165 - 206 GB/s ???
-  // 256/288 threads: 159 - 198 GB/s ???
-  // 224/256 64 B:    163 - 193 GB/s ???
-  // 256/288 64 B:    157 - 188 GB/s ???
-  
-  // Size = 64 MB U
-  // Blit:            186 - 219 GB/s
-  // 224/256 threads: 156 - 195 GB/s
-  // 256/288 threads: 155 - 194 GB/s
-  // 224/256 64 B:    159 - 190 GB/s ???
-  // 256/288 64 B:    153 - 188 GB/s ???
-  
   // Only used in performance testing mode.
   #if true
-  
-  
+  let isAligned = false
+  let srcOffset = isAligned ? 128 : 128
+  let dstOffset = isAligned ? 128 : 128
+  var customBytesCopied: Int? = nil
   #else
   let srcOffset = Int.random(in: 0..<16384)
   let dstOffset = Int.random(in: 0..<16384)
@@ -113,24 +107,31 @@ func validationTest() {
   let library = device.makeDefaultLibrary()!
   
   var pipelines: [String: MTLComputePipelineState] = [:]
-  for name in ["copyBufferAligned", "copyBufferEdgeCases"] {
+  let alignedFunction = library.makeFunction(name: "copyBufferAligned")!
+  let alignedPipeline = try! device.makeComputePipelineState(function: alignedFunction)
+  pipelines["copyBufferAligned"] = alignedPipeline
+  
+  for byteRealignment in 0...3 {
     let constants = MTLFunctionConstantValues()
     var use_shader_validation: Bool = false
     constants.setConstantValue(&use_shader_validation, type: .bool, index: 0)
     
-    let desc = MTLComputePipelineDescriptor()
-    desc.computeFunction = try! library.makeFunction(
-      name: name, constantValues: constants)
-    desc.threadGroupSizeIsMultipleOfThreadExecutionWidth = true
+    var byte_realignment_is_zero: Bool = byteRealignment == 0
+    constants.setConstantValue(&byte_realignment_is_zero, type: .bool, index: 1)
     
-    let pipeline = try! device.makeComputePipelineState(
-      descriptor: desc, options: [], reflection: nil)
-    precondition(pipeline.maxTotalThreadsPerThreadgroup == 1024)
-    pipelines[name] = pipeline
+    let function = try! library.makeFunction(
+      name: "copyBufferEdgeCases", constantValues: constants)
+    let pipeline = try! device.makeComputePipelineState(function: function)
+    precondition(pipeline.maxTotalThreadsPerThreadgroup >= 256)
+    pipelines["copyBufferEdgeCases\(byteRealignment)"] = pipeline
   }
   
-  var bufferSrc = device.makeBuffer(length: bufferSize)!
-  var bufferDst = device.makeBuffer(length: bufferSize)!
+  func makeBuffer(_ index: Int) -> MTLBuffer {
+    return device.makeBuffer(length: bufferSize)!
+  }
+  
+  var buffersSrc = (0..<numRepetitions).map(makeBuffer)
+  var buffersDst = (0..<numRepetitions).map(makeBuffer)
   var minCopyTime: Double = 1_000
   var maxBandwidth: Double = 0
   
@@ -161,7 +162,7 @@ func validationTest() {
 outer:
   for _ in 0..<numTrials {
     defer {
-      swap(&bufferSrc, &bufferDst)
+      swap(&buffersSrc, &buffersDst)
     }
     
     var thisSrcOffset: Int
@@ -188,10 +189,10 @@ outer:
     if !testingPerformance {
       // Clear the destination buffer and reference destination.
       memset(referenceDst, 0, bufferSize)
-      memset(bufferDst.contents(), 0, bufferSize)
+      memset(buffersDst[0].contents(), 0, bufferSize)
       
       // Initialize the source buffer and simulate a correct memcpy.
-      memcpy(bufferSrc.contents(), referenceSrc, bufferSize)
+      memcpy(buffersSrc[0].contents(), referenceSrc, bufferSize)
       memcpy(
         referenceDst + thisDstOffset, referenceSrc + thisSrcOffset,
         thisBytesCopied)
@@ -199,136 +200,148 @@ outer:
     
     // Encode GPU work.
     let commandBuffer = commandQueue.makeCommandBuffer()!
+    let amountOfWork = testingPerformance ? numRepetitions : 1
+    let encoder = commandBuffer.makeComputeCommandEncoder()!
     if usingBlitEncoder {
-      let encoder = commandBuffer.makeBlitCommandEncoder()!
-      defer { encoder.endEncoding() }
-      encoder.copy(
-        from: bufferSrc, sourceOffset: thisSrcOffset, to: bufferDst,
-        destinationOffset: thisDstOffset, size: thisBytesCopied)
-    } else {
-      let encoder = commandBuffer.makeComputeCommandEncoder()!
-      defer { encoder.endEncoding() }
-      
-      var useFastPath = false
-      if usingAlignedFastPath {
-        if thisSrcOffset % 64 == 0 && thisDstOffset % 64 == 0 {
-          if thisBytesCopied % 4 == 0 {
-            useFastPath = true
+      encoder.endEncoding()
+    }
+    var _blitEncoder: MTLBlitCommandEncoder?
+    for bufferID in 0..<amountOfWork {
+      let bufferSrc = buffersSrc[bufferID]
+      let bufferDst = buffersDst[bufferID]
+      if usingBlitEncoder {
+        if _blitEncoder == nil {
+          _blitEncoder = commandBuffer.makeBlitCommandEncoder()!
+        }
+        let encoder = _blitEncoder!
+        encoder.copy(
+          from: bufferSrc, sourceOffset: thisSrcOffset, to: bufferDst,
+          destinationOffset: thisDstOffset, size: thisBytesCopied)
+      } else {
+        var useFastPath = false
+        if usingAlignedFastPath {
+          var minDstOffset: Int
+          if thisBytesCopied > 12 * 1024 * 1024 {
+            minDstOffset = 64
+          } else {
+            // The edge-cases shader becomes slower between 8-16 MB.
+            // This is 16x the magnitude of the L2 cache on M1, but something
+            // plausable on the M1 Max. Coincidence?
+            minDstOffset = 4
+          }
+          if thisSrcOffset % 4 == 0 && thisDstOffset % minDstOffset == 0 {
+            if thisBytesCopied % 4 == 0 {
+              useFastPath = true
+            }
           }
         }
-      }
-      
-      if useFastPath {
-        let pipeline = pipelines["copyBufferAligned"]!
-        encoder.setComputePipelineState(pipeline)
-        encoder.setBuffer(bufferSrc, offset: thisSrcOffset, index: 0)
-        encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
-        encoder.dispatchThreads(
-          MTLSizeMake(thisBytesCopied / 4, 1, 1),
-          threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
-      } else {
-        let pipeline = pipelines["copyBufferEdgeCases"]!
-        encoder.setComputePipelineState(pipeline)
         
-        // Encode buffer bindings.
-        let srcTrueVA = bufferSrc.gpuAddress + UInt64(thisSrcOffset)
-        let dstTrueVA = bufferDst.gpuAddress + UInt64(thisDstOffset)
-        let src_base = srcTrueVA & ~UInt64(transactionBytes - 1)
-        let dst_base = dstTrueVA & ~UInt64(transactionBytes - 1)
-        let srcBaseOffset = Int(src_base - bufferSrc.gpuAddress)
-        let dstBaseOffset = Int(dst_base - bufferDst.gpuAddress)
-        encoder.setBuffer(bufferSrc, offset: srcBaseOffset, index: 0)
-        encoder.setBuffer(bufferDst, offset: dstBaseOffset, index: 1)
-        
-        precondition(bufferSrc.gpuAddress % UInt64(transactionBytes) == 0)
-        precondition(bufferDst.gpuAddress % UInt64(transactionBytes) == 0)
-        precondition(src_base % UInt64(transactionBytes) == 0)
-        precondition(dst_base % UInt64(transactionBytes) == 0)
-        
-        // Encode dispatch arguments.
-        struct Arguments {
-          var src_start: UInt32 = 0
-          var dst_start: UInt32 = 0
-          var src_end: UInt32 = 0
-          var dst_end: UInt32 = 0
-          
-          var src_start_distance: UInt16 = 0
-          var dst_start_distance: UInt16 = 0
-          var src_end_distance: UInt16 = 0
-          var dst_end_distance: UInt16 = 0
-          
-          var word_realignment: Int16 = 0
-          var bytes_after_word_realignment: UInt16 = 0
-          var word_rounded_realignment: Int16 = 0
-        }
-        var arguments = Arguments()
-        let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
-        let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
-        
-        // This is rounded down.
-        let srcStartDelta = Int(srcTrueVA) - Int(src_base)
-        let dstStartDelta = Int(dstTrueVA) - Int(dst_base)
-        arguments.src_start = .init(srcStartDelta / 4)
-        arguments.dst_start = .init(dstStartDelta / 4)
-        
-        // This is rounded up.
-        let srcEndDelta = Int(srcEndVA) - Int(src_base)
-        let dstEndDelta = Int(dstEndVA) - Int(dst_base)
-        arguments.src_end = .init(srcEndDelta / 4)
-        arguments.dst_end = .init(dstEndDelta / 4)
-        
-        arguments.src_start_distance =
-          .init(srcStartDelta - 4 * Int(arguments.src_start))
-        arguments.dst_start_distance =
-          .init(dstStartDelta - 4 * Int(arguments.dst_start))
-        arguments.src_end_distance =
-          .init(srcEndDelta - 4 * Int(arguments.src_end))
-        arguments.dst_end_distance =
-          .init(dstEndDelta - 4 * Int(arguments.dst_end))
-        
-        let absolute_realignment = Int(srcTrueVA % UInt64(transactionBytes)) - Int(dstTrueVA % UInt64(transactionBytes))
-        let word_realignment = (absolute_realignment + transactionBytes) / 4 - transactionBytes / 4
-        arguments.word_realignment = Int16(word_realignment)
-        arguments.bytes_after_word_realignment =
-          .init(absolute_realignment - 4 * word_realignment)
-        arguments.word_rounded_realignment =
-          arguments.word_realignment & ~Int16(transactionWords - 1)
-        precondition(word_realignment * 4 <= absolute_realignment)
-        
-        let argumentsSize = MemoryLayout<Arguments>.stride
-        precondition(argumentsSize == 32)
-        encoder.setBytes(&arguments, length: argumentsSize, index: 2)
-        if printArguments {
-          print(arguments)
-        }
-        
-        // Dispatch correct amount of threads.
-        let _thisBytesCopied = UInt64(thisBytesCopied)
-        var srcUpperChunkBoundary = srcTrueVA + _thisBytesCopied - 1
-        var dstUpperChunkBoundary = dstTrueVA + _thisBytesCopied - 1
-        srcUpperChunkBoundary = srcUpperChunkBoundary & ~(UInt64(transactionBytes) - 1) + UInt64(transactionBytes)
-        dstUpperChunkBoundary = dstUpperChunkBoundary & ~(UInt64(transactionBytes) - 1) + UInt64(transactionBytes)
-        
-        let dstScannedBytes = Int(dstUpperChunkBoundary - dst_base)
-        let numWords = dstScannedBytes / 4
-        let numChunks = numWords / transactionWords
-        if usingThreadgroups {
-          let numActiveSimds = numActiveThreads / 32
-          let numChunksRoundedUp =
-            (numChunks + numActiveSimds - 1) / numActiveSimds * numActiveSimds
-          let numThreadgroups = numChunksRoundedUp / numActiveSimds
-          encoder.dispatchThreadgroups(
-            MTLSizeMake(numThreadgroups, 1, 1),
-            threadsPerThreadgroup: MTLSizeMake(numActiveThreads + 32, 1, 1))
-        } else {
-          let numThreadgroups = (numChunks + 8 - 1) / 8
-          encoder.dispatchThreadgroups(
-            MTLSizeMake(numThreadgroups, 1, 1),
+        if useFastPath {
+          let pipeline = pipelines["copyBufferAligned"]!
+          encoder.setComputePipelineState(pipeline)
+          encoder.setBuffer(bufferSrc, offset: thisSrcOffset, index: 0)
+          encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
+          encoder.dispatchThreads(
+            MTLSizeMake(thisBytesCopied / 4, 1, 1),
             threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
+        } else {
+          let srcTrueVA = bufferSrc.gpuAddress + UInt64(thisSrcOffset)
+          let dstTrueVA = bufferDst.gpuAddress + UInt64(thisDstOffset)
+          let src_base = srcTrueVA & ~(64 - 1)
+          let dst_base = dstTrueVA & ~(64 - 1)
+          let srcBaseOffset = Int(src_base - bufferSrc.gpuAddress)
+          let dstBaseOffset = Int(dst_base - bufferDst.gpuAddress)
+          precondition(bufferSrc.gpuAddress % 64 == 0)
+          precondition(bufferDst.gpuAddress % 64 == 0)
+          precondition(src_base % 64 == 0)
+          precondition(dst_base % 64 == 0)
+          
+          struct Arguments {
+            var src_start: UInt32 = 0
+            var dst_start: UInt32 = 0
+            var src_end: UInt32 = 0
+            var dst_end: UInt32 = 0
+            
+            var src_start_distance: UInt16 = 0
+            var dst_start_distance: UInt16 = 0
+            var src_end_distance: UInt16 = 0
+            var dst_end_distance: UInt16 = 0
+            
+            var word_realignment: Int16 = 0
+            var word_rounded_realignment: Int16 = 0
+            var byte_realignment_lo_shift: UInt16 = 0
+            var byte_realignment_hi_shift: UInt16 = 0
+          }
+          var arguments = Arguments()
+          let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
+          let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
+          
+          // This is rounded down.
+          let srcStartDelta = Int(srcTrueVA) - Int(src_base)
+          let dstStartDelta = Int(dstTrueVA) - Int(dst_base)
+          arguments.src_start = .init(srcStartDelta / 4)
+          arguments.dst_start = .init(dstStartDelta / 4)
+          
+          // This is rounded up.
+          let srcEndDelta = Int(srcEndVA) - Int(src_base)
+          let dstEndDelta = Int(dstEndVA) - Int(dst_base)
+          arguments.src_end = .init(srcEndDelta / 4)
+          arguments.dst_end = .init(dstEndDelta / 4)
+          
+          arguments.src_start_distance =
+            .init(srcStartDelta - 4 * Int(arguments.src_start))
+          arguments.dst_start_distance =
+            .init(dstStartDelta - 4 * Int(arguments.dst_start))
+          arguments.src_end_distance =
+            .init(srcEndDelta - 4 * Int(arguments.src_end))
+          arguments.dst_end_distance =
+            .init(dstEndDelta - 4 * Int(arguments.dst_end))
+          
+          let absolute_realignment = Int(srcTrueVA % 64) - Int(dstTrueVA % 64)
+          let word_realignment = (absolute_realignment + 64) / 4 - 16
+          arguments.word_realignment = Int16(word_realignment)
+          arguments.word_rounded_realignment =
+          arguments.word_realignment & ~(16 - 1)
+          precondition(word_realignment * 4 <= absolute_realignment)
+          
+          let byte_realignment = absolute_realignment - 4 * word_realignment
+          arguments.byte_realignment_lo_shift = UInt16(byte_realignment * 8)
+          arguments.byte_realignment_hi_shift = UInt16(32 - byte_realignment * 8)
+          
+          let pipeline = pipelines["copyBufferEdgeCases\(byte_realignment)"]!
+          encoder.setComputePipelineState(pipeline)
+          encoder.setBuffer(bufferSrc, offset: srcBaseOffset, index: 0)
+          encoder.setBuffer(bufferDst, offset: dstBaseOffset, index: 1)
+          
+          let argumentsSize = MemoryLayout<Arguments>.stride
+          precondition(argumentsSize == 32)
+          encoder.setBytes(&arguments, length: argumentsSize, index: 2)
+          if printArguments {
+            print(arguments)
+            print("byte_realignment: \(byte_realignment)")
+          }
+          
+          
+          // Dispatch correct amount of threads.
+          let _thisBytesCopied = UInt64(thisBytesCopied)
+          var srcUpperChunkBoundary = srcTrueVA + _thisBytesCopied - 1
+          var dstUpperChunkBoundary = dstTrueVA + _thisBytesCopied - 1
+          srcUpperChunkBoundary = srcUpperChunkBoundary & ~(64 - 1) + 64
+          dstUpperChunkBoundary = dstUpperChunkBoundary & ~(64 - 1) + 64
+          
+          let dstScannedBytes = Int(dstUpperChunkBoundary - dst_base)
+          let numWords = dstScannedBytes / 4
+          let helperThreads = Int(arguments.word_realignment + 16) % 16 + 1
+          encoder.dispatchThreadgroups(
+            MTLSizeMake((numWords + 224 - 16) / 224, 1, 1),
+            threadsPerThreadgroup: MTLSizeMake(224 + helperThreads, 1, 1))
         }
-        
       }
     }
+    if !usingBlitEncoder {
+      encoder.endEncoding()
+    }
+    _blitEncoder?.endEncoding()
     commandBuffer.commit()
     commandBuffer.waitUntilCompleted()
     
@@ -336,14 +349,14 @@ outer:
       // Update `minCopyTime` and `maxBandwidth`.
       // Bandwidth should report the actual bytes transferred.
       let time = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
-      let bandwidth = Double(2 * thisBytesCopied) / time
+      let bandwidth = Double(numRepetitions * 2 * thisBytesCopied) / time
       if bandwidth > maxBandwidth {
         maxBandwidth = bandwidth
         minCopyTime = time
       }
     } else {
       // Validate that results are correct. Otherwise, print how it failed.
-      let error = memcmp(referenceDst, bufferDst.contents(), bufferSize)
+      let error = memcmp(referenceDst, buffersDst[0].contents(), bufferSize)
       if error != 0 {
         print("Failed with:")
         print("Source offset: \(thisSrcOffset)")
@@ -352,7 +365,7 @@ outer:
         
         let referenceDstCasted = referenceDst
           .assumingMemoryBound(to: SIMD4<UInt8>.self)
-        let bufferDstCasted = bufferDst
+        let bufferDstCasted = buffersDst[0]
           .contents().assumingMemoryBound(to: SIMD4<UInt8>.self)
         var numFailures = 0
         
