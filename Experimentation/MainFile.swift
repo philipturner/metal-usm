@@ -157,21 +157,41 @@ func oldMainFunc3() {
   print("SIGSEGV", SIGSEGV)
   print("SIGBUS", SIGBUS)
   
-  //  let temporary_file = tmpfile()!
-  //  print(fileno(temporary_file))
-  //  let fd = fileno(temporary_file)
-  //  ftruncate(fd, 1024 * 1024);
+    let temporary_file = tmpfile()!
+    print(fileno(temporary_file))
+    let fd = fileno(temporary_file)
+    ftruncate(fd, 1024 * 1024);
   
   // 4 * 16384
   // 4 TB of virtual memory is enough to span all addresses we need.
   // Aim to set GPU VA
-  let length = 1024 * 1024 * 1024 * 1024 * 4
+  //  let length = 1024 * 1024 * 1024 * 1024 * 4
+  
+#if os(macOS)
+//  let length = 1024 * 1024 * 1024 * 1024 * 95
+  let length = 1024 * 1024 * 1024 * 97850 // max length
+  // 97850 GB / 2^7 * 1024 GB = 74.65% (3/4)
+  // base address for largest allocation: 0x7000000000 = 448 GB
+  // span: 0 GB - 448 GB --------------- 98298 GB ----- 131072 GB
+#elseif os(iOS)
+//  let length = 1024 * 1024 * 1024 * 52
+  let length = 1024 * 1024 * 53760 // max length
+  // 53760 MB / 2^9 * 1024 MB = 10.25% (1/10)
+  // base address for largest allocation: 0x2a0000000 = 11008 MB
+  // span: 0 GB - 11008 MB -- 64768 MB ------------------ 524288 MB
+#endif
+  
+  // On iOS, snap the VA to 84 GB start or round down otherwise. Hope this works!
+  // Try allocating 64 GB of VM on iOS, then progressively down by 8 GB steps.
+  // On macOS, 95 TB of virtual memory.
   
   // 0x0000001500018000
-  let bitPattern = 0x0000001500018000 * 0b10000
-  let desiredPointer = UnsafeMutableRawPointer(bitPattern: bitPattern)!
-  let actualPointer = mmap(desiredPointer, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, Int32(-1), 0);
-  precondition(actualPointer == desiredPointer, "\(actualPointer) \(desiredPointer) \(errno)")
+//  let bitPattern = 0x0000001500018000 * 0b10000
+//  let desiredPointer = UnsafeMutableRawPointer(bitPattern: bitPattern)!
+  let actualPointer = mmap(nil, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, Int32(-1), 0)!
+  print(errno)
+  print(actualPointer)
+//  precondition(actualPointer == desiredPointer, "\(actualPointer) \(desiredPointer) \(errno)")
   
   let chunkSize = 32768
   let paddingSize = 32768
@@ -186,6 +206,16 @@ func oldMainFunc3() {
   // Use the PyTorch allocator as a reference for this, and find how many heaps
   // are present on an average basis.
   
+  do {
+    let heapDesc = MTLHeapDescriptor()
+    heapDesc.type = .automatic
+    heapDesc.hazardTrackingMode = .untracked
+    heapDesc.resourceOptions = .storageModeShared
+    heapDesc.size = 1024 * 1024
+    let heap = device.makeHeap(descriptor: heapDesc)!
+    print(heap.makeBuffer(length: 1)!.heapOffset)
+  }
+  
   // Try to keep allocating until you align it right.
   struct Allocation {
     var bufferID: Int
@@ -194,14 +224,14 @@ func oldMainFunc3() {
     var cpuOffset: Int
   }
   var successes: [Allocation] = []
-  let (baseBufferID, baseVA) = allocBuffer(address: desiredPointer, offset: maxCPUOffset, length: 32768)
+  let (baseBufferID, baseVA) = allocBuffer(address: actualPointer, offset: maxCPUOffset, length: 32768)
   successes.append(Allocation(bufferID: baseBufferID, gpuAddress: baseVA, length: 32768, cpuOffset: maxCPUOffset))
   maxCPUOffset += 32768
   
   func allocate(length: Int) -> Allocation {
     // On Apple GPUs, Metal allocations are typically off by 32768 bytes.
     var currentOffset = maxCPUOffset + 32768
-    var (currentBufferID, currentVA) = allocBuffer(address: desiredPointer, offset: currentOffset, length: length)
+    var (currentBufferID, currentVA) = allocBuffer(address: actualPointer, offset: currentOffset, length: length)
     
     var numAttempts = 1
     var deltaCPU = currentOffset - baseCPUOffset
@@ -211,7 +241,7 @@ func oldMainFunc3() {
       deallocBuffer(bufferID: currentBufferID, offset: currentOffset, length: length)
       
       currentOffset = (deltaGPU - deltaCPU) + currentOffset
-      (currentBufferID, currentVA) = allocBuffer(address: desiredPointer, offset: currentOffset, length: length)
+      (currentBufferID, currentVA) = allocBuffer(address: actualPointer, offset: currentOffset, length: length)
       deltaCPU = currentOffset - baseCPUOffset
       deltaGPU = Int(currentVA) - Int(baseVA)
       
@@ -230,7 +260,7 @@ func oldMainFunc3() {
     return Allocation(bufferID: currentBufferID, gpuAddress: currentVA, length: length, cpuOffset: currentOffset)
   }
   
-  let scaleFactor = 256 // 8-16 GB
+  let scaleFactor = 16 // 256 // 8-16 GB
   successes.append(allocate(length: 32768 * 1024 * scaleFactor))
   successes.append(allocate(length: 65536 * 1024 * scaleFactor))
   successes.append(allocate(length: 65536 * 1024 * scaleFactor))
@@ -444,8 +474,19 @@ func oldMainFunc() {
   let function = library.makeFunction(name: "vectorAddition")!
   let pipeline = try! device.makeComputePipelineState(function: function)
   
+  var ret: Int = 0
+  var size: Int = 8
+  let error = sysctlbyname("machdep.virtual_address_size", &ret, &size, nil, 0)
+  guard error == 0 else {
+    fatalError("Could not find sysctl value.")
+  }
+  print("sysctl value:", ret)
+  
+  
+  
   // Initialize the buffers.
-  let bufferLength = 16 * 1024 * 1024 * 400 //1024
+//  print(device.recommendedMaxWorkingSetSize / 1024 / 1024)
+  let bufferLength = 3725 * 1024 * 1024 / 4
 //  precondition(device.maxBufferLength == bufferLength)
   let bufferA = device.makeBuffer(
     length: bufferLength, options: .storageModeShared)!
@@ -455,6 +496,7 @@ func oldMainFunc() {
     length: bufferLength, options: .storageModeShared)!
   let bufferD = device.makeBuffer(
     length: bufferLength, options: .storageModeShared)!
+  print(bufferA.gpuAddress)
   
   // Dispatch the command.
   let queue = device.makeCommandQueue()!
