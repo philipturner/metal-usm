@@ -27,20 +27,18 @@ import OrderedCollections
 // Unique heaps: >1/128 memory per device, larger buffers or when facing
 // significant memory pressure
 //
-// The memory pressure watermark area should be between 1/2 and 2/3 device
-// memory. Numbers above come from the 2/3 mark (actually 65/100), toward the
-// closest even-enough cutoff from a power of 2 (1.00, 1.25, 1.50, 1.75). Large
-// allocations should be rounded to 2x the size of small allocations.
+// Numbers above come from the 2/3 mark (actually 65/100) of device memory,
+// toward the closest even-enough cutoff from a power of 2 (1.00, 1.25, 1.50,
+// 1.75).
 //
-// 256 resident heaps will approximately double encoding latency. Assume the low
-// watermark (1/2 RAM) is the largest realistic working set size, so derive
-// overhead from 3/4 the max allocations. Overhead is (encoding, scheduling)
-// with a baseline of (6 us, 32 us) per batch.
+// 256 resident heaps will approximately double encoding latency. Assume 1/2 RAM
+// is the largest realistic working set size, so derive overhead from 3/4 the
+// max allocations. Overhead is (encoding, scheduling) with a baseline of
+// (6 us, 32 us) per batch.
 //
 // Original PyTorch constants:
 // kMaxSmallAlloc: 1 MB
 // kMinLargeAlloc: 10 MB
-// kRoundLarge: 2 MB
 // kSmallHeap: 8 MB
 // kLargeHeap: 32 MB
 // kXLargeHeap: 1024 MB
@@ -48,7 +46,6 @@ import OrderedCollections
 // For a 5.4 GB A15, we revise the PyTorch constants to:
 // kMaxSmallAlloc: 1.75 MB
 // kMinLargeAlloc: 28 MB
-// kRoundLarge: 3.5 MB
 // kSmallHeap: 14 MB
 // kLargeHeap: 56 MB
 // kXLargeHeap: 56 MB
@@ -58,7 +55,6 @@ import OrderedCollections
 // For a 32 GB M1 Max, we revise the PyTorch constants to:
 // kMaxSmallAlloc: 10 MB
 // kMinLargeAlloc: 160 MB
-// kRoundLarge: 20 MB
 // kSmallHeap: 80 MB
 // kLargeHeap: 320 MB
 // kXLargeHeap: 320 MB
@@ -68,7 +64,6 @@ import OrderedCollections
 // For a 192 GB M2 Ultra, we revise the PyTorch constants to:
 // kMaxSmallAlloc: 64 MB
 // kMinLargeAlloc: 1024 MB
-// kRoundLarge: 128 MB
 // kSmallHeap: 512 MB
 // kLargeHeap: 2048 MB
 // kXLargeHeap: 2048 MB
@@ -279,20 +274,14 @@ class HeapPool {
   var device: MTLDevice
   var cpuBaseVA: UnsafeMutableRawPointer
   var gpuBaseVA: UInt64
-  
   var physicalMemoryLimit: Int
-  var physicalMemoryWatermark: Int
   var virtualMemoryLimit: Int
-  var hasMemoryPressure: Bool {
-    device.currentAllocatedSize > physicalMemoryWatermark
-  }
   
   // Borrowed from PyTorch MPSAllocator. We don't cache the buffers; they are
   // immediately returned to the heap. This helps reduce fragmentation, as we
   // can't afford to exceed device memory (unlike PyTorch).
   var kMaxSmallAlloc: Int
   var kMinLargeAlloc: Int
-  var kRoundLarge: Int
   var kSmallHeap: Int
   var kLargeHeap: Int
   
@@ -339,13 +328,10 @@ class HeapPool {
     
     let physicalMemoryMax = fetchSysctlProperty(name: "hw.memsize")
     self.physicalMemoryLimit = (65 * (physicalMemoryMax >> 20) / 100) << 20
-    self.physicalMemoryWatermark = physicalMemoryMax / 2
     self.physicalMemoryLimit = max(physicalMemoryLimit, device.maxBufferLength)
     #if os(macOS)
     let reportedMemoryLimit = Int(device.recommendedMaxWorkingSetSize)
     self.physicalMemoryLimit = min(physicalMemoryLimit, reportedMemoryLimit)
-    self.physicalMemoryWatermark = min(
-      physicalMemoryLimit, physicalMemoryWatermark)
     #endif
     
     // Small heaps are 1/256 of device memory.
@@ -373,7 +359,6 @@ class HeapPool {
     
     self.kMaxSmallAlloc = smallHeapSize / 8
     self.kMinLargeAlloc = smallHeapSize * 2
-    self.kRoundLarge = smallHeapSize / 4
     self.kSmallHeap = smallHeapSize
     self.kLargeHeap = smallHeapSize * 4
     
@@ -502,10 +487,6 @@ class HeapPool {
         // We're not actually going to use the memory watermark like PyTorch
         // does. In low-memory situations, that would create numerous tiny
         // buffers and tank encoding performance.
-        // TODO: Erase the code for finding the memory watermark, after
-        // debugging and ensuring you don't need it. Also save this work to the
-        // cloud (delete via a special commit message), in case you change your
-        // mind.
         heapSize = kLargeHeap
       } else {
         // We're not going to mark heaps as "split" and treat them differently.
@@ -517,14 +498,7 @@ class HeapPool {
         // However, you should not have to pay for allocating a 500 MB heap if
         // when quickly allocating/deallocating a 32 KB buffer. We lazily
         // release zombie heaps when one fails to allocate.
-        
-        // We have no need for kRoundLarge, as we'll immediately deallocate this
-        // buffer.
-        // TODO: Erase the code and documentation for kRoundLarge, after
-        // debugging and ensuring you don't need it. Also save this work to the
-        // cloud (delete via a special commit message), in case you change your
-        // mind.
-        heapSize = kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge)
+        heapSize = size
       }
       
       // This should fail if you exceed device memory.
