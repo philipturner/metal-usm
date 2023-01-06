@@ -85,23 +85,65 @@ func mainFunc() {
   let function = library.makeFunction(name: "vectorAddition")!
   let pipeline = try! device.makeComputePipelineState(function: function)
   
-  
-  
   // We'll search through everything in binary trees.
   // Sorted lists for allocating memory:
   // - Small heaps: sorted by increasing available size
-  // - Small buffers*: pooled from all heaps, sorted by increasing size
   // - Large heaps: sorted by increasing available size
-  // - Large buffers*: pooled from all heaps, sorted by increasing size
-  // *The buffers seem superfluous, in fact harmful for fragmentation. Only
-  // consider recycling them if allocation takes >1 us and/or scales with size.
   //
   // Sorted lists for mapping memory:
-  // - 
+  // - All heaps: sorted by address
   // Only consider the original idea (radix search) if this takes >1 us per 8
   // queries, >500 ns per 4 queries, and >250 ns per 2 queries.
   
+  let pool = HeapPool(device: device)
+  precondition(pool.queryTotalSize() == 0)
   
+  let pointer1 = pool.allocate(size: 1024)!
+  precondition(pool.queryTotalSize() == 1024)
+  pointer1.assumingMemoryBound(to: UInt32.self)[0] = 7
+  pool.deallocate(usmPointer: pointer1)
+  precondition(pool.queryTotalSize() == 0)
+  
+  let bufferSize = max(4096, 768 * 1024 * 1024)
+  let bufferA = pool.allocate(size: bufferSize)!
+  let bufferB = pool.allocate(size: bufferSize)!
+  let bufferC = pool.allocate(size: bufferSize)!
+  let buffersList = [bufferA, bufferB, bufferC]
+  let patternsList: [UInt64] = [4, 50, 600]
+  for (buffer, var pattern) in zip(buffersList, patternsList) {
+    memset_pattern8(buffer, &pattern, 4096)
+  }
+  
+  let bufferD = pool.allocate(size: bufferSize)!
+  
+  let commandBuffer = commandQueue.makeCommandBuffer()!
+  let encoder = commandBuffer.makeComputeCommandEncoder()!
+  encoder.setComputePipelineState(pipeline)
+  encoder.useResources(pool.extractBuffers(), usage: [.read, .write])
+  
+  let pointers1 = [bufferA, bufferB, bufferC, bufferD].map { usmPointer in
+    let (buffer, offset) = pool.getBufferAndOffset(usmPointer: usmPointer)!
+    return buffer.gpuAddress + UInt64(offset)
+  }
+  encoder.setBytes(pointers1, length: 32, index: 0)
+  encoder.dispatchThreads(
+    MTLSizeMake(4096 / 16, 1, 1), threadsPerThreadgroup: MTLSizeMake(1, 1, 1))
+  encoder.endEncoding()
+  commandBuffer.commit()
+  commandBuffer.waitUntilCompleted()
+  
+  let output = bufferD.assumingMemoryBound(to: UInt64.self)
+  for i in 0..<4096 / 8 {
+    guard output[i] == 654 else {
+      fatalError("Element \(i) was \(output[i]), not 654.")
+    }
+  }
+  print("succeeded! \(output[0])")
+  
+  pool.deallocate(usmPointer: bufferD)
+  pool.deallocate(usmPointer: bufferC)
+  pool.deallocate(usmPointer: bufferB)
+  pool.deallocate(usmPointer: bufferA)
 }
 
 func oldMainFunc1() {
@@ -293,6 +335,18 @@ class HeapPool {
   // have no overhead.
   var heapsAddressSorted: OrderedSet<HeapBlock> = []
   
+  // TODO: Don't implement this in C++. It's only for debugging in the Swift
+  // prototype. We'll want something more formal for debugging anyway.
+  func queryTotalSize() -> Int {
+    validateAddressSorted()
+    return heapsAddressSorted.reduce(0, { $0 + $1/*heap.*/.usedSize })
+  }
+  
+  // TODO: Find a better way to cache the buffer list.
+  func extractBuffers() -> [MTLBuffer] {
+    heapsAddressSorted.map { $0.buffer }
+  }
+  
   func validateSizeSorted() {
     for set in [smallHeapsSizeSorted, largeHeapsSizeSorted] {
       if set.count > 1 {
@@ -302,13 +356,20 @@ class HeapPool {
           let element1_size = UInt64(element1.availableSize)
           let element2_size = UInt64(element2.availableSize)
           precondition(
-            element1_size < element2_size, "Allocations are not sorted.")
+            element1_size <= element2_size, "Allocations are not sorted.")
         }
       }
     }
   }
   
   func validateAddressSorted() {
+    let numHeapsFromAddress = heapsAddressSorted.count
+    let numHeapsFromSize =
+      smallHeapsSizeSorted.count + largeHeapsSizeSorted.count
+    precondition(
+      numHeapsFromAddress == numHeapsFromSize,
+      "An allocation wasn't removed/inserted correctly.")
+    
     if heapsAddressSorted.count > 1 {
       for i in 0..<heapsAddressSorted.count - 1 {
         let element1 = heapsAddressSorted[i]
@@ -365,7 +426,8 @@ class HeapPool {
     // MARK: - Allocate Virtual Memory
     
     #if os(macOS)
-    let virtualMemoryMax = max(1024 * 1024 * 1024 * 1024, 3 * globalMemory)
+    // Either a terabyte or 3x the actual RAM size.
+    let virtualMemoryMax = max(1 << 40, 3 * physicalMemoryMax)
     #else
     let virtualAddressBits = fetchSysctlProperty(
       name: "machdep.virtual_address_size")
@@ -460,6 +522,8 @@ class HeapPool {
     }
   }
   
+  // If this returns `nil`, stall until all GPU work has finished.
+  // Perhaps it will free up some extra memory - at which point, try again.
   func allocate(size: Int) -> UnsafeMutableRawPointer? {
     precondition(size < device.maxBufferLength, "Buffer too large.")
     
@@ -471,7 +535,7 @@ class HeapPool {
     }
     validateSizeSorted()
     defer {
-      // Ensure everything's correct before returning too.
+      // Ensure everything's correct before returning.
       validateSizeSorted()
       validateAddressSorted()
     }
@@ -498,7 +562,11 @@ class HeapPool {
         // However, you should not have to pay for allocating a 500 MB heap if
         // when quickly allocating/deallocating a 32 KB buffer. We lazily
         // release zombie heaps when one fails to allocate.
-        heapSize = size
+        
+        // Round up to 128 KB, the maximum page size witnessed in Metal Frame
+        // Capture.
+        let kRoundLarge = 128 * 1024
+        heapSize = kRoundLarge * ((size + kRoundLarge - 1) / kRoundLarge)
       }
       
       // This should fail if you exceed device memory.
@@ -510,7 +578,7 @@ class HeapPool {
       
       // Also remove from the set of addresses.
       func releaseHeaps(from set: inout OrderedSet<HeapBlock>) {
-        while set.last?.heap.currentAllocatedSize == 0 {
+        while set.last?/*heap.*/.usedSize == 0 {
           let removed = set.removeLast()
           heapsAddressSorted.remove(removed)
         }
@@ -547,10 +615,11 @@ class HeapPool {
     }
     
     let usmPointer = block.allocate(size: size)
+    let newSize = block.availableSize
     if size < kMaxSmallAlloc {
-      insert(block, into: &smallHeapsSizeSorted, size: size)
+      insert(block, into: &smallHeapsSizeSorted, size: newSize)
     } else {
-      insert(block, into: &largeHeapsSizeSorted, size: size)
+      insert(block, into: &largeHeapsSizeSorted, size: newSize)
     }
     return usmPointer
   }
@@ -559,29 +628,47 @@ class HeapPool {
   // allocating memory. Preserve one empty block perfectly equalling kSmallHeap
   // and another perfectly equalling kLargeHeap.
   func deallocate(usmPointer: UnsafeMutableRawPointer) {
-    let index = heapsAddressSorted.firstIndex(
-      where: { $0.cpuBaseVA <= usmPointer })
+    let index = heapsAddressSorted.firstIndex(where: {
+      $0.cpuBaseVA <= usmPointer &&
+      usmPointer < $0.cpuBaseVA + $0.heap.size
+    })
     guard let index = index else {
       fatalError("Tried to deallocate an invalid USM pointer.")
     }
-    let heapBlock = heapsAddressSorted[index]
-    let heapSize = heapBlock.heap.size
-    precondition(heapSize >= kSmallHeap, "Heap was too small.")
-    if heapSize == kSmallHeap {
-      _ = smallHeapsSizeSorted.remove(heapBlock)!
-    } else {
-      _ = largeHeapsSizeSorted.remove(heapBlock)!
+    
+    var shouldKeepInAddressSet = false
+    defer {
+      if !shouldKeepInAddressSet {
+        heapsAddressSorted.remove(at: index)
+      }
+      validateAddressSorted()
+      validateSizeSorted()
     }
     
-    heapBlock.deallocate(usmPointer: usmPointer)
-    if heapBlock.availableSize == heapSize {
+    let block = heapsAddressSorted[index]
+    let heapSize = block.heap.size
+    precondition(heapSize >= kSmallHeap, "Heap was too small.")
+    if heapSize == kSmallHeap {
+      _ = smallHeapsSizeSorted.remove(block)!
+    } else {
+      _ = largeHeapsSizeSorted.remove(block)!
+    }
+    
+    // Let the block deallocate its pointer internally.
+    block.deallocate(usmPointer: usmPointer)
+    
+    // Handle special cases where the heap's contents are completely
+    // deallocated.
+    if block.availableSize == heapSize {
       if heapSize == kSmallHeap {
-        if smallHeapsSizeSorted.last?.heap.currentAllocatedSize == 0 {
+        if smallHeapsSizeSorted.last?/*heap.*/.usedSize == 0 {
           // There's already a buffer against allocation thrashing.
           return
         }
       } else if heapSize == kLargeHeap {
-        if largeHeapsSizeSorted.last?.heap.currentAllocatedSize == 0 {
+        // If a heap doesn't have size `kLargeHeap`, it's either 100% occupied
+        // or eagerly freed.
+        if largeHeapsSizeSorted.last?/*heap.*/.usedSize == 0 {
           // There's already a buffer against allocation thrashing.
           precondition(
             largeHeapsSizeSorted.last!.availableSize == kLargeHeap,
@@ -598,11 +685,45 @@ class HeapPool {
         return
       }
     }
+    
+    // We can keep the address where it is, without inserting it again.
+    shouldKeepInAddressSet = true
+    
+    // Insert possible zombie heap back into the list.
+    let newSize = block.availableSize
+    if heapSize == kSmallHeap {
+      insert(block, into: &smallHeapsSizeSorted, size: newSize)
+    } else {
+      insert(block, into: &largeHeapsSizeSorted, size: newSize)
+    }
   }
   
-  // TODO: Make searching function.
+  func getBufferAndOffset(
+    usmPointer: UnsafeMutableRawPointer
+  ) -> (MTLBuffer, Int)? {
+    let index = heapsAddressSorted.firstIndex(where: {
+      $0.cpuBaseVA <= usmPointer &&
+      usmPointer < $0.cpuBaseVA + $0.heap.size
+    })
+    guard let index = index else {
+      // Invalid USM pointer, but we don't need to crash the program.
+      return nil
+    }
+    let heapBlock = heapsAddressSorted[index]
+    
+    // No need to pre-determine whether the pointer fits in this block. If it
+    // doesn't, the result will be -1.
+    let offset = heapBlock.getOffset(usmPointer: usmPointer)
+    if offset == -1 {
+      return nil
+    }
+    return (heapBlock.buffer, offset)
+  }
 }
 
+// NOTE: In Swift, it seems the OrderedList does not binary-search when
+// iterating through elements. That's okay because the C++ version will.
+//
 // The class itself isn't stored in any list sorted by offset. That would incur
 // extra overhead when mapping pointers to buffers. Rather, we create a sorted
 // set of VAs to search.
@@ -612,8 +733,15 @@ class HeapBlock {
   var buffer: MTLBuffer
   var cpuBaseVA: UnsafeMutableRawPointer
   var gpuBaseVA: UInt64
+  var heapVA: UInt64
   var availableSize: Int
   private var phantomBuffers: [Int: MTLBuffer] = [:]
+  
+  // Heap used size isn't a reliable way to find used size. There's a bug where
+  // it returns 4 GB when you have a 4 GB heap, even though no resources are
+  // allocated. The maxAvailableSize(alignment:) still says you can allocate
+  // stuff on the heap.
+  var usedSize: Int = 0
   
   struct Allocation: Hashable {
     var offset: Int
@@ -649,8 +777,11 @@ class HeapBlock {
     guard let heap = device.makeHeap(descriptor: heapDescriptor) else {
       return nil
     }
-    heap.setPurgeableState(.empty)
+    defer {
+      heap.setPurgeableState(.empty)
+    }
     self.heap = heap
+//    precondition(heap.usedSize == 0, "Heap did not start with size 0.")
     
     var targetAddress = gpuBaseVA
     var finalBuffer: MTLBuffer?
@@ -679,38 +810,124 @@ class HeapBlock {
     self.gpuBaseVA = gpuAddress
     self.cpuBaseVA = cpuBaseVA + Int(gpuAddress - gpuBaseVA)
     self.availableSize = heap.maxAvailableSize(alignment: 16384)
+    
+    // The heap doesn't give us its base address, but we can find a way to
+    // acquire it anyway. First allocate a buffer, and see how it impacts
+    // available size. The second buffer should come right after it, and max
+    // available size should decrease by the same amount.
+    //
+    // If we ever see different behavior, we still have enough information to
+    // reconstruct the base VA.
+    precondition(
+      availableSize == heap.size,
+      "Heap available size mismatch: \(availableSize) != \(heap.size).")
+    precondition(
+      availableSize == size,
+      "Heap available size mismatch: \(availableSize) != \(size).")
+//    precondition(
+//      heap.usedSize == 0,
+//      "Heap used size not 0: \(heap.usedSize).")
+    precondition(
+      heap.currentAllocatedSize == size,
+      "Heap allocated size not \(size): \(heap.currentAllocatedSize).")
+    
+    
+    
+    func estimateBaseVA() -> UInt64 {
+      let buffer1 = heap.makeBuffer(length: 16384)!
+      
+      // Automatic heaps should set the offset to 0.
+      var newAvailableSize = heap.maxAvailableSize(alignment: 16384)
+      precondition(
+        buffer1.heapOffset == 0,
+        "Unexpected heap allocation behavior: \(buffer1.heapOffset) != 0")
+      precondition(
+        newAvailableSize == availableSize - 16384,
+        "Unexpected heap allocation behavior: \(newAvailableSize) != \(availableSize - 16384).")
+//      precondition(
+//        heap.usedSize == 16384,
+//        "Unexpected heap allocation behavior: \(heap.usedSize) != \(16384).")
+      precondition(
+        heap.currentAllocatedSize == size,
+        "Heap allocated size not \(size): \(heap.currentAllocatedSize).")
+//      precondition(heap.usedSize + newAvailableSize == heap.currentAllocatedSize)
+      
+      let buffer2 = heap.makeBuffer(length: 16384)!
+      
+      // Automatic heaps should set the offset to 0.
+      newAvailableSize = heap.maxAvailableSize(alignment: 16384)
+      precondition(
+        buffer2.heapOffset == 0,
+        "Unexpected heap allocation behavior: \(buffer2.heapOffset) != 0")
+      precondition(
+        buffer2.gpuAddress > buffer1.gpuAddress,
+        "Unexpected heap allocation behavior: \(buffer2.gpuAddress) not > \(buffer1.gpuAddress).")
+      precondition(
+        buffer2.gpuAddress == buffer1.gpuAddress + 16384,
+        "Unexpected heap allocation behavior: \(buffer2.gpuAddress) != \(buffer1.gpuAddress) + 16384.")
+//      precondition(
+//        heap.usedSize == 32768,
+//        "Unexpected heap allocation behavior: \(heap.usedSize) != \(32768).")
+      precondition(
+        heap.currentAllocatedSize == size,
+        "Heap allocated size not \(size): \(heap.currentAllocatedSize).")
+      precondition(
+        newAvailableSize == availableSize - 32768,
+        "Unexpected heap allocation behavior: \(newAvailableSize) != \(availableSize - 32768).")
+//      precondition(heap.usedSize + newAvailableSize == heap.currentAllocatedSize)
+      return buffer1.gpuAddress
+    }
+    self.heapVA = 0
+    self.heapVA = estimateBaseVA()
+    precondition(self.heapVA == estimateBaseVA())
+  
+    // Ensure the temporary buffers deallocated.
+//    precondition(
+//      heap.usedSize == 0,
+//      "Heap used size not 0: \(heap.usedSize).")
+    precondition(
+      heap.currentAllocatedSize == size,
+      "Heap allocated size not \(size): \(heap.currentAllocatedSize).")
+    let currentAvailableSize = heap.maxAvailableSize(alignment: 16384)
+    precondition(
+      availableSize == currentAvailableSize,
+      "Heap available size mismatch: \(availableSize) != \(currentAvailableSize).")
   }
   
   func allocate(size: Int) -> UnsafeMutableRawPointer {
     precondition(
       size <= availableSize,
       "Didn't check size before allocating buffer from heap.")
+    validateSorted()
     
-    let previousAllocatedSize = heap.currentAllocatedSize
+//    let previousUsedSize = heap.usedSize
     let phantomBuffer = heap.makeBuffer(length: size)!
-    let offset = Int(phantomBuffer.gpuAddress - gpuBaseVA)
+    let offset = Int(phantomBuffer.gpuAddress - heapVA)
     let phantomSize = phantomBuffer.allocatedSize
     phantomBuffers[offset] = phantomBuffer
     
-    // Insert after the first element that's less.
-    let possibleIndex = allocations.firstIndex(where: { $0.offset < offset })
-    let insertionIndex = (possibleIndex != nil) ? possibleIndex! + 1 : 0
+    // Insert before the first element that's greater.
+    let insertionIndex =
+      allocations.firstIndex(where: { $0.offset > offset }) ?? allocations.count
     let allocation = Allocation(offset: offset, size: phantomSize)
+    validateSorted()
     allocations.insert(allocation, at: insertionIndex)
     validateSorted()
     
-    // Adjust the available size.
-    let newAllocatedSize = heap.currentAllocatedSize
-    precondition(
-      newAllocatedSize == previousAllocatedSize + phantomSize,
-      "Unexpected heap size.")
+    self.usedSize += size
+//    // Adjust the available size.
+//    let newUsedSize = heap.usedSize
+//    precondition(
+//      newUsedSize == previousUsedSize + phantomSize,
+//      "Unexpected heap size.")
     self.availableSize = heap.maxAvailableSize(alignment: 16384)
     return cpuBaseVA + offset
   }
   
   func deallocate(usmPointer: UnsafeMutableRawPointer) {
+    validateSorted()
     let offset = usmPointer - cpuBaseVA
-    let previousAllocatedSize = heap.currentAllocatedSize
+//    let previousUsedSize = heap.usedSize
     var phantomSize: Int
     do {
       // In C++, you would explicitly release the buffer.
@@ -718,7 +935,9 @@ class HeapBlock {
       guard let phantomBuffer = phantomBuffer else {
         fatalError("Pointer did not originate from this heap.")
       }
+      validateSorted()
       let removalIndex = allocations.firstIndex(where: { $0.offset == offset })!
+      validateSorted()
       let removed = allocations.remove(at: removalIndex)
       validateSorted()
       
@@ -726,11 +945,12 @@ class HeapBlock {
       precondition(removed.size == phantomSize)
     }
     
-    // Adjust the available size.
-    let newAllocatedSize = heap.currentAllocatedSize
-    precondition(
-      newAllocatedSize + phantomSize == previousAllocatedSize,
-      "Unexpected heap size.")
+    self.usedSize -= phantomSize
+//    // Adjust the available size.
+//    let newUsedSize = heap.usedSize
+//    precondition(
+//      newUsedSize + phantomSize == previousUsedSize,
+//      "Unexpected heap size.")
     self.availableSize = heap.maxAvailableSize(alignment: 16384)
   }
   
@@ -740,19 +960,21 @@ class HeapBlock {
   //
   // Defer the actual optimization until later. In fact, it can be a hipSYCL
   // pull request. Just quantify the performance impact.
-  func translate(usmPointer: UnsafeMutableRawPointer) -> UInt64? {
-    var gpuAddress: UInt64 = 0
+  func getOffset(usmPointer: UnsafeMutableRawPointer) -> Int {
     let offset = usmPointer - cpuBaseVA
-    if offset > 0 {
-      let index = allocations.firstIndex(where: { $0.offset <= offset })
+    if offset >= 0 {
+      let index = allocations.firstIndex(where: {
+        $0.offset <= offset &&
+        offset < $0.offset + $0.size
+      })
       if let index = index {
-        let allocation = allocations[index]
-        if offset < allocation.offset + allocation.size {
-          gpuAddress = gpuBaseVA + UInt64(offset)
-        }
+//        let allocation = allocations[index]
+//        if offset < allocation.offset + allocation.size {
+          return offset
+//        }
       }
     }
-    return gpuAddress
+    return -1
   }
 }
 
