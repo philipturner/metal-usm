@@ -76,26 +76,24 @@ func mainFunc() {
 // Thoroughly validates a wide range of edge cases, and times them. Compares to
 // the blit encoder. It can also disable the "copyBufferAligned" fast-path.
 func validationTest() {
-  // TODO: Optimize the edge cases by implementing byte_realignment.
-  
-  let testingPerformance = false
-  let bufferSize = testingPerformance ? 256 * 1024 * 1024 : 256 * 1024
+  let testingPerformance = true
+  let bufferSize = testingPerformance ? 128 * 1024 * 1024 : 256 * 1024
   let numTrials = 15
   let numRepetitions = 1
   let doingMemset = true
-  var pattern: [UInt8] = [234, 25, 99, 88]
+  var pattern: [UInt8] = [234, 77, 90, 99]
   
   let usingBlitEncoder = false
   let usingAlignedFastPath = true
   let forceUseCustomOffsets = false
   let generateRepeatingPattern = false
-  let printArguments = false
+  let printArguments = true
   
   // Only used in performance testing mode.
   #if true
   let isAligned = true
   let srcOffset = isAligned ? 0 : 128
-  let dstOffset = isAligned ? 64 : 128
+  let dstOffset = isAligned ? 1 : 128
   var customBytesCopied: Int? = nil
   #else
   let srcOffset = Int.random(in: 0..<16384)
@@ -115,18 +113,20 @@ func validationTest() {
   let library = device.makeDefaultLibrary()!
   
   var copyAlignedPipeline: MTLComputePipelineState
-  var fillPipeline: MTLComputePipelineState
+  var fillAlignedPipeline: MTLComputePipelineState
   var copyEdge0Pipeline: MTLComputePipelineState
   var copyEdge1Pipeline: MTLComputePipelineState
+  var fillEdge0Pipeline: MTLComputePipelineState
+  var fillEdge1Pipeline: MTLComputePipelineState
   do {
     let copyAlignedFunction = library.makeFunction(name: "copyBufferAligned")!
+    let fillAlignedFunction = library.makeFunction(name: "fillBufferAligned")!
     copyAlignedPipeline = try! device.makeComputePipelineState(
       function: copyAlignedFunction)
-    let fillFunction = library.makeFunction(name: "fillBuffer")!
-    fillPipeline = try! device.makeComputePipelineState(
-      function: fillFunction)
+    fillAlignedPipeline = try! device.makeComputePipelineState(
+      function: fillAlignedFunction)
     
-    // Copy buffer edge 4
+    // Copy buffer edge 0
     let constants = MTLFunctionConstantValues()
     var use_shader_validation: Bool = false
     constants.setConstantValue(&use_shader_validation, type: .bool, index: 0)
@@ -145,6 +145,24 @@ func validationTest() {
       name: "copyBufferEdgeCases", constantValues: constants)
     copyEdge1Pipeline = try! device.makeComputePipelineState(
       function: copyEdge1Function)
+    
+    // Fill buffer edge 0
+    var pattern_small_and_divisible_4: Bool = true
+    constants.setConstantValue(
+      &pattern_small_and_divisible_4, type: .bool, index: 2)
+    let fillEdge0Function = try! library.makeFunction(
+      name: "fillBufferEdgeCases", constantValues: constants)
+    fillEdge0Pipeline = try! device.makeComputePipelineState(
+      function: fillEdge0Function)
+    
+    // Fill buffer edge 1
+    pattern_small_and_divisible_4 = false
+    constants.setConstantValue(
+      &pattern_small_and_divisible_4, type: .bool, index: 2)
+    let fillEdge1Function = try! library.makeFunction(
+      name: "fillBufferEdgeCases", constantValues: constants)
+    fillEdge1Pipeline = try! device.makeComputePipelineState(
+      function: fillEdge1Function)
   }
   
   func makeBuffer(_ index: Int) -> MTLBuffer {
@@ -273,101 +291,112 @@ outer:
             destinationOffset: thisDstOffset, size: thisBytesCopied)
         }
       } else if doingMemset {
-        var _pattern = pattern
-        if _pattern.count == 1 || _pattern.count == 3 {
-          _pattern += _pattern
-        }
-        if _pattern.count == 2 || _pattern.count == 6 {
-          _pattern += _pattern
-        }
-        
-        struct FillArguments {
-          var fast_path1: Bool = false
-          var fast_path2: Bool = false
-          var fast_path3: Bool = false
-          var fast_path4: Bool = false
-          var slow_path: Bool = false
-          
-          var fast_path12_bitmask: UInt16 = 0
-          var fast_path34_power_2: UInt16 = 0
-          var pattern_alignment: UInt32 = 0
-        }
-        var arguments = FillArguments()
-        
-        var is_1_power_2 = false
-        var is_3_power_2 = false
-        if _pattern.count % 4 == 0,
-           _pattern.count <= Int(UInt16.max) + 1 {
-          if _pattern.count.nonzeroBitCount == 1 {
-            is_1_power_2 = true
-          } else if _pattern.count % 3 == 0,
-                    (_pattern.count / 3).nonzeroBitCount == 1 {
-            is_3_power_2 = true
-            precondition(
-              _pattern.count.nonzeroBitCount == 2 &&
-              _pattern.count.trailingZeroBitCount +
-              _pattern.count.leadingZeroBitCount == 62,
-            "Pattern was not 3*2^n")
-          }
-        }
-        
-        var numThreads: Int
         let dstAddress = bufferDst.gpuAddress + UInt64(thisDstOffset)
-        if dstAddress % 4 == 0,
-           thisBytesCopied % 4 == 0,
-           is_1_power_2 {
-          arguments.fast_path1 = true
-          arguments.pattern_alignment = UInt32(_pattern.count / 4);
-          numThreads = thisBytesCopied / 4
-        } else if dstAddress % 2 == 0,
-                  thisBytesCopied % 2 == 0,
-                  is_1_power_2 {
-          arguments.fast_path2 = true
-          arguments.pattern_alignment = UInt32(_pattern.count / 2)
-          numThreads = thisBytesCopied / 2
-        } else if dstAddress % 4 == 0,
-                  thisBytesCopied % 4 == 0,
-                  is_3_power_2 {
-          arguments.fast_path3 = true
-          arguments.pattern_alignment = UInt32(_pattern.count / 4)
-          numThreads = thisBytesCopied / 4
-        } else if dstAddress % 2 == 0,
-                  thisBytesCopied % 2 == 0,
-                  is_3_power_2 {
-          arguments.fast_path4 = true
-          arguments.pattern_alignment = UInt32(_pattern.count / 2)
-          numThreads = thisBytesCopied / 2
+        if usingAlignedFastPath,
+           pattern.count.nonzeroBitCount == 1,
+           pattern.count <= 32,
+           dstAddress % 4 == 0,
+           thisBytesCopied % 4 == 0 {
+          var _pattern = pattern
+          while _pattern.count < 32 {
+            _pattern += _pattern
+          }
+          encoder.setComputePipelineState(fillAlignedPipeline)
+          encoder.setBytes(&_pattern, length: _pattern.count, index: 0)
+          encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
+          encoder.dispatchThreads(
+            MTLSizeMake(thisBytesCopied / 4, 1, 1),
+            threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
         } else {
-          arguments.slow_path = true
-          arguments.pattern_alignment = UInt32(_pattern.count)
-          numThreads = thisBytesCopied
+          var _pattern = pattern
+          while true {
+            if _pattern.count * 2 > 256 * 4 {
+              break
+            } else {
+              _pattern += _pattern
+            }
+          }
+          
+          let dstTrueVA = bufferDst.gpuAddress + UInt64(thisDstOffset)
+          let dst_base = dstTrueVA & ~(64 - 1)
+          let dstBaseOffset = Int(dst_base - bufferDst.gpuAddress)
+          precondition(bufferDst.gpuAddress % 64 == 0)
+          precondition(dst_base % 64 == 0)
+          
+          struct FillArguments {
+            var dst_start: UInt32 = 0
+            var dst_end: UInt32 = 0
+            var dst_start_distance: UInt16 = 0
+            var dst_end_distance: UInt16 = 0
+            
+            var pattern_size_words: UInt32 = 0
+            var pattern_size_bytes: UInt32 = 0
+            var active_threads: UInt16 = 0
+            
+            var pattern_small_and_divisible_4: Bool = false
+            var pattern_divisible_4: Bool = false
+          }
+          var arguments = FillArguments()
+          let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
+          
+          let dstStartDelta = Int(dstTrueVA) - Int(dst_base)
+          let dstEndDelta = Int(dstEndVA) - Int(dst_base)
+          arguments.dst_start = .init(dstStartDelta / 4)
+          arguments.dst_end = .init(dstEndDelta / 4)
+          arguments.dst_start_distance =
+            .init(dstStartDelta - 4 * Int(arguments.dst_start))
+          arguments.dst_end_distance =
+            .init(dstEndDelta - 4 * Int(arguments.dst_end))
+          
+          let pattern_size = _pattern.count
+          arguments.pattern_size_words = .init(pattern_size / 4)
+          arguments.pattern_size_bytes = .init(pattern_size)
+          arguments.active_threads = 256
+          
+          if pattern_size % 4 == 0 {
+            if pattern_size <= 1024 {
+              arguments.pattern_small_and_divisible_4 = true;
+              arguments.active_threads = .init(arguments.pattern_size_words)
+            } else {
+              arguments.pattern_divisible_4 = true;
+            }
+          }
+          
+          var is_fast_path = arguments.pattern_small_and_divisible_4
+          is_fast_path = is_fast_path && (pattern_size == 1024)
+          
+          // Pad the pattern's start and end.
+          let endPadding = (_pattern[0], _pattern[1], _pattern[2])
+          let startPadding = _pattern[(pattern_size - dstStartDelta)...]
+          _pattern = startPadding + _pattern
+          if !is_fast_path {
+            _pattern.append(endPadding.0)
+            _pattern.append(endPadding.1)
+            _pattern.append(endPadding.2)
+          }
+          
+          if is_fast_path {
+            encoder.setComputePipelineState(fillEdge0Pipeline)
+          } else {
+            encoder.setComputePipelineState(fillEdge1Pipeline)
+          }
+          
+          let argumentsLength = MemoryLayout<FillArguments>.stride
+          encoder.setBytes(&_pattern, length: _pattern.count, index: 0)
+          encoder.setBuffer(bufferDst, offset: dstBaseOffset, index: 1)
+          encoder.setBytes(&arguments, length: argumentsLength, index: 2)
+          
+          // Dispatch correct amount of threads.
+          let _thisBytesCopied = UInt64(thisBytesCopied)
+          var dstUpperWordBoundary = dstTrueVA + _thisBytesCopied - 1
+          dstUpperWordBoundary = dstUpperWordBoundary & ~(4 - 1) + 4
+          
+          let dstScannedWords = Int(dstUpperWordBoundary - dst_base) / 4
+          let numThreads = Int(arguments.active_threads)
+          encoder.dispatchThreadgroups(
+            MTLSizeMake((dstScannedWords + numThreads - 1) / numThreads, 1, 1),
+            threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
         }
-        arguments.fast_path12_bitmask =
-          UInt16(truncatingIfNeeded: arguments.pattern_alignment - 1)
-        var power_2: Int
-        if (is_3_power_2) {
-          power_2 = (arguments.pattern_alignment / 3).trailingZeroBitCount
-        } else {
-          power_2 = (arguments.pattern_alignment / 1).trailingZeroBitCount
-        }
-        arguments.fast_path34_power_2 = UInt16(power_2)
-        
-        let argumentsLength = MemoryLayout<FillArguments>.stride
-        if printArguments {
-          print(arguments)
-          print("Pattern:", _pattern)
-          print("Num Threads:", numThreads)
-          print("Dst offset: \(thisDstOffset)")
-          print("Bytes copied: \(thisBytesCopied)")
-        }
-        
-        encoder.setComputePipelineState(fillPipeline)
-        encoder.setBytes(&_pattern, length: _pattern.count, index: 0)
-        encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
-        encoder.setBytes(&arguments, length: argumentsLength, index: 2)
-        encoder.dispatchThreads(
-          MTLSizeMake(numThreads, 1, 1),
-          threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
       } else {
         var useFastPath = false
         if usingAlignedFastPath {
@@ -426,13 +455,11 @@ outer:
           let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
           let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
           
-          // This is rounded down.
           let srcStartDelta = Int(srcTrueVA) - Int(src_base)
           let dstStartDelta = Int(dstTrueVA) - Int(dst_base)
           arguments.src_start = .init(srcStartDelta / 4)
           arguments.dst_start = .init(dstStartDelta / 4)
           
-          // This is rounded up.
           let srcEndDelta = Int(srcEndVA) - Int(src_base)
           let dstEndDelta = Int(dstEndVA) - Int(dst_base)
           arguments.src_end = .init(srcEndDelta / 4)
