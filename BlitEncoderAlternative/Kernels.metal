@@ -8,30 +8,48 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Not much value in optimizing memset, especially edge cases.
-// TODO: Ensure the 4-case has similar performance to blit encoder.
-//
-// Alignment - alignment of pattern or destination, whichever is smaller.
-//
-// If pattern is small and not a multiple of 4, try duplicating it.
-// (e.g. AB -> ABAB = 2 -> 4, ABC -> ABCABCABCABC = 3 -> 12)
-// Next, repeat the pattern to match threadgroup size.
+// Not much value in optimizing edge cases - just 2^n and 3*2^n. Promote 1, 2,
+// 3, and 6-byte patterns to 4 or 12. Misaligned addresses (not multiples of 4)
+// take a massive penalty, slower than a blit encoder.
+struct FillArguments {
+  // `dst`, `len` are 4-aligned and pattern is 4x power of 2 (under 2^16).
+  ushort fast_path1; // 16-bit boolean
+  
+  // Bit mask to avoid integer modulus.
+  ushort fast_path1_bitmask;
+  
+  // `dst`, `len` are 4-aligned and pattern is (4,12)x power of 2.
+  ushort fast_path2; // 16-bit boolean
+  
+  // `dst`, `len` are 2-aligned and pattern is (2,6)x power of 2.
+  ushort fast_path3; // 16-bit boolean
+  
+  uint pattern_alignment;
+};
+
 kernel void fillBuffer
  (
   constant void *pattern [[buffer(0)]],
   device void *dst [[buffer(1)]],
-  constant uint &alignment [[buffer(2)]],
-  uint tid [[thread_position_in_grid]],
-  ushort thread_id [[thread_position_in_threadgroup]])
+  constant FillArguments &args [[buffer(2)]],
+  uint tid [[thread_position_in_grid]])
 {
-  if (alignment == 4) {
-    // Use varied threadgroup size to implement integer modulus.
-    // Fastest in the best case, SIMD-divergent in the worst case.
-    uint value = ((constant uint*)pattern)[thread_id];
+  // TODO: Determine whether refactoring control flow improves performance.
+  if (args.fast_path1) {
+    ushort index = ushort(tid) & args.fast_path1_bitmask;
+    uint value = ((constant uint*)pattern)[index];
     ((device uint*)dst)[tid] = value;
+  } else if (args.fast_path2) {
+    uint index = tid % (args.pattern_alignment / 4);
+    uint value = ((constant uint*)pattern)[index];
+    ((device uint*)dst)[tid] = value;
+  } else if (args.fast_path3) {
+    uint index = tid % (args.pattern_alignment / 2);
+    ushort value = ((constant ushort*)pattern)[index];
+    ((device ushort*)dst)[tid] = value;
   } else {
-    // Massive pattern or misaligned destination address.
-    uchar value = ((constant uchar*)pattern)[tid % alignment];
+    uint index = tid % args.pattern_alignment;
+    uchar value = ((constant uchar*)pattern)[index];
     ((device uchar*)dst)[tid] = value;
   }
 }
@@ -50,7 +68,7 @@ kernel void copyBufferAligned
 // boundaries. Unaligned data transfers are shuffled through threadgroup memory.
 // The middle 6 simdgroups of every threadgroup have less arithmetic intensity,
 // and almost always incur full 64-byte transactions.
-struct Arguments {
+struct CopyArguments {
   // Offset in 32-bit words, rounded down.
   uint src_start;
   uint dst_start;
@@ -103,7 +121,7 @@ kernel void copyBufferEdgeCases
  (
   device uchar4 *src_base [[buffer(0)]],
   device uchar4 *dst_base [[buffer(1)]],
-  constant Arguments &args [[buffer(2)]],
+  constant CopyArguments &args [[buffer(2)]],
   
   // Threadgroup size assumed to be 256.
   // Simdgroup size assumed to be 32.
