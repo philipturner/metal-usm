@@ -13,6 +13,10 @@ func mainFunc() {
 //  originalTest()
 }
 
+// NOTE: hipSYCL must break up large memcpy/memset calls into 2 GB chunks. This
+// removes worries about integer overflows and improves responsiveness - max 10
+// milliseconds on macOS, 80 milliseconds on iOS.
+
 // Bandwidth variation with different parameters.
 // - Reference implementation 1: blit encoder, aligned
 // - Reference implementation 2: blit encoder, src_offset=2, dst_offset=289
@@ -72,10 +76,16 @@ func mainFunc() {
 // Thoroughly validates a wide range of edge cases, and times them. Compares to
 // the blit encoder. It can also disable the "copyBufferAligned" fast-path.
 func validationTest() {
-  let testingPerformance = true
-  let bufferSize = testingPerformance ? 16 * 1024 : 256 * 1024
+  // TODO: Thoroughly validate that fillBuffer works correctly.
+  // TODO: Test various `dstOffset` values (keep `srcOffset` at zero).
+  // TODO: Turn off Metal API Validation.
+  
+  let testingPerformance = false
+  let bufferSize = testingPerformance ? 256 * 1024 * 1024 : 256 * 1024
   let numTrials = 15
-  let numRepetitions = 128
+  let numRepetitions = 1
+  let doingMemset = true
+  var pattern: [UInt8] = [234, 213]
   
   let usingAlignedFastPath = true
   let usingBlitEncoder = false
@@ -85,9 +95,9 @@ func validationTest() {
   
   // Only used in performance testing mode.
   #if true
-  let isAligned = false
-  let srcOffset = isAligned ? 128 : 128
-  let dstOffset = isAligned ? 128 : 128
+  let isAligned = true
+  let srcOffset = isAligned ? 0 : 128
+  let dstOffset = isAligned ? 0 : 128
   var customBytesCopied: Int? = nil
   #else
   let srcOffset = Int.random(in: 0..<16384)
@@ -106,24 +116,37 @@ func validationTest() {
   let commandQueue = device.makeCommandQueue()!
   let library = device.makeDefaultLibrary()!
   
-  var pipelines: [String: MTLComputePipelineState] = [:]
-  let alignedFunction = library.makeFunction(name: "copyBufferAligned")!
-  let alignedPipeline = try! device.makeComputePipelineState(function: alignedFunction)
-  pipelines["copyBufferAligned"] = alignedPipeline
-  
-  for byteRealignment in 0...3 {
+  var copyAlignedPipeline: MTLComputePipelineState
+  var fillPipeline: MTLComputePipelineState
+  var copyEdge0Pipeline: MTLComputePipelineState
+  var copyEdge1Pipeline: MTLComputePipelineState
+  do {
+    let copyAlignedFunction = library.makeFunction(name: "copyBufferAligned")!
+    copyAlignedPipeline = try! device.makeComputePipelineState(
+      function: copyAlignedFunction)
+    let fillFunction = library.makeFunction(name: "fillBuffer")!
+    fillPipeline = try! device.makeComputePipelineState(
+      function: fillFunction)
+    
+    // Copy buffer edge 4
     let constants = MTLFunctionConstantValues()
     var use_shader_validation: Bool = false
     constants.setConstantValue(&use_shader_validation, type: .bool, index: 0)
     
-    var byte_realignment_is_zero: Bool = byteRealignment == 0
+    var byte_realignment_is_zero: Bool = true
     constants.setConstantValue(&byte_realignment_is_zero, type: .bool, index: 1)
-    
-    let function = try! library.makeFunction(
+    let copyEdge0Function = try! library.makeFunction(
       name: "copyBufferEdgeCases", constantValues: constants)
-    let pipeline = try! device.makeComputePipelineState(function: function)
-    precondition(pipeline.maxTotalThreadsPerThreadgroup >= 256)
-    pipelines["copyBufferEdgeCases\(byteRealignment)"] = pipeline
+    copyEdge0Pipeline = try! device.makeComputePipelineState(
+      function: copyEdge0Function)
+    
+    // Copy buffer edge 1
+    byte_realignment_is_zero = false
+    constants.setConstantValue(&byte_realignment_is_zero, type: .bool, index: 1)
+    let copyEdge1Function = try! library.makeFunction(
+      name: "copyBufferEdgeCases", constantValues: constants)
+    copyEdge1Pipeline = try! device.makeComputePipelineState(
+      function: copyEdge1Function)
   }
   
   func makeBuffer(_ index: Int) -> MTLBuffer {
@@ -142,8 +165,26 @@ func validationTest() {
     free(referenceDst)
   }
   if !testingPerformance {
-    // Only generate random numbers once, minimizing time wasted on the CPU.
-    if generateRepeatingPattern {
+    if doingMemset {
+      if pattern.count == 1 {
+        let value = Int32(pattern[0])
+        memset(referenceSrc, value, bufferSize)
+      } else if pattern.count == 2 {
+        var value = SIMD4<UInt8>(
+          pattern[0], pattern[1], pattern[0], pattern[1])
+        memset_pattern4(referenceSrc, &value, bufferSize)
+      } else {
+        for i in 0..<bufferSize / pattern.count {
+          let offset = i * pattern.count
+          memcpy(referenceSrc + offset, &pattern, pattern.count)
+        }
+        for i in 0..<bufferSize % pattern.count {
+          let offset = i + (bufferSize / pattern.count) * pattern.count
+          memcpy(referenceSrc + offset, &pattern[i], 1)
+        }
+      }
+    } else if generateRepeatingPattern {
+      // Only generate random numbers once, minimizing time wasted on the CPU.
       let referenceSrcCasted = referenceSrc.assumingMemoryBound(to: UInt8.self)
       for i in 0..<bufferSize {
         referenceSrcCasted[i] = UInt8(truncatingIfNeeded: i % 256)
@@ -214,9 +255,31 @@ outer:
           _blitEncoder = commandBuffer.makeBlitCommandEncoder()!
         }
         let encoder = _blitEncoder!
-        encoder.copy(
-          from: bufferSrc, sourceOffset: thisSrcOffset, to: bufferDst,
-          destinationOffset: thisDstOffset, size: thisBytesCopied)
+        if doingMemset {
+          guard pattern.count == 1 else {
+            fatalError("Blit encoder doesn't support pattern size > 1.")
+          }
+          let range = thisDstOffset..<thisDstOffset + thisDstOffset
+          encoder.fill(buffer: bufferDst, range: range, value: pattern[0])
+        } else {
+          encoder.copy(
+            from: bufferSrc, sourceOffset: thisSrcOffset, to: bufferDst,
+            destinationOffset: thisDstOffset, size: thisBytesCopied)
+        }
+      } else if doingMemset {
+        encoder.setComputePipelineState(fillPipeline)
+        
+//        var patternAlignment: Int
+//        var targetThreadgroupSize: Int
+//        if pattern.count % 4 == 0 {
+//
+//        } else if pattern.count * 4 < 256 * 4 {
+//
+//        } else if pattern.count * 4 < 768 * 4 {
+//
+//        } else {
+//          // Bind the pattern itself to the compute encoder.
+//        }
       } else {
         var useFastPath = false
         if usingAlignedFastPath {
@@ -237,8 +300,7 @@ outer:
         }
         
         if useFastPath {
-          let pipeline = pipelines["copyBufferAligned"]!
-          encoder.setComputePipelineState(pipeline)
+          encoder.setComputePipelineState(copyAlignedPipeline)
           encoder.setBuffer(bufferSrc, offset: thisSrcOffset, index: 0)
           encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
           encoder.dispatchThreads(
@@ -256,7 +318,7 @@ outer:
           precondition(src_base % 64 == 0)
           precondition(dst_base % 64 == 0)
           
-          struct Arguments {
+          struct CopyArguments {
             var src_start: UInt32 = 0
             var dst_start: UInt32 = 0
             var src_end: UInt32 = 0
@@ -272,7 +334,7 @@ outer:
             var byte_realignment_lo_shift: UInt16 = 0
             var byte_realignment_hi_shift: UInt16 = 0
           }
-          var arguments = Arguments()
+          var arguments = CopyArguments()
           let srcEndVA = srcTrueVA + UInt64(thisBytesCopied)
           let dstEndVA = dstTrueVA + UInt64(thisBytesCopied)
           
@@ -308,19 +370,21 @@ outer:
           arguments.byte_realignment_lo_shift = UInt16(byte_realignment * 8)
           arguments.byte_realignment_hi_shift = UInt16(32 - byte_realignment * 8)
           
-          let pipeline = pipelines["copyBufferEdgeCases\(byte_realignment)"]!
-          encoder.setComputePipelineState(pipeline)
+          if byte_realignment == 0 {
+            encoder.setComputePipelineState(copyEdge0Pipeline)
+          } else {
+            encoder.setComputePipelineState(copyEdge1Pipeline)
+          }
           encoder.setBuffer(bufferSrc, offset: srcBaseOffset, index: 0)
           encoder.setBuffer(bufferDst, offset: dstBaseOffset, index: 1)
           
-          let argumentsSize = MemoryLayout<Arguments>.stride
+          let argumentsSize = MemoryLayout<CopyArguments>.stride
           precondition(argumentsSize == 32)
           encoder.setBytes(&arguments, length: argumentsSize, index: 2)
           if printArguments {
             print(arguments)
             print("byte_realignment: \(byte_realignment)")
           }
-          
           
           // Dispatch correct amount of threads.
           let _thisBytesCopied = UInt64(thisBytesCopied)
@@ -349,7 +413,11 @@ outer:
       // Update `minCopyTime` and `maxBandwidth`.
       // Bandwidth should report the actual bytes transferred.
       let time = commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
-      let bandwidth = Double(numRepetitions * 2 * thisBytesCopied) / time
+      var bytesCopied = numRepetitions * thisBytesCopied
+      if !doingMemset {
+        bytesCopied *= 2
+      }
+      let bandwidth = Double(bytesCopied) / time
       if bandwidth > maxBandwidth {
         maxBandwidth = bandwidth
         minCopyTime = time
