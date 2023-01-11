@@ -8,22 +8,32 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Not much value in optimizing edge cases - just 2^n and 3*2^n. Promote 1, 2,
-// 3, and 6-byte patterns to 4 or 12. Misaligned addresses (not multiples of 4)
-// take a massive penalty, slower than a blit encoder.
+// Not much value in optimizing edge cases. Promote 1, 2, 3, and 6-byte patterns
+// to 4 or 12. Misaligned addresses (not multiples of 4) take a massive penalty,
+// slower than a blit encoder.
 struct FillArguments {
-  // `dst`, `len` are 4-aligned and pattern is 4x power of 2 (under 2^16).
-  ushort fast_path1; // 16-bit boolean
+  // `dst`, `len` are 4-aligned, and pattern is 1x power of 2 (at most 2^16).
+  bool fast_path1;
   
-  // Bit mask to avoid integer modulus.
-  ushort fast_path1_bitmask;
+  // `dst`, `len` are 2-aligned, and pattern is 1x power of 2 (at most 2^16).
+  bool fast_path2;
   
-  // `dst`, `len` are 4-aligned and pattern is (4,12)x power of 2.
-  ushort fast_path2; // 16-bit boolean
+  // `dst`, `len` are 4-aligned. and pattern is 3x power of 2 (at most 2^16).
+  bool fast_path3;
   
-  // `dst`, `len` are 2-aligned and pattern is (2,6)x power of 2.
-  ushort fast_path3; // 16-bit boolean
+  // `dst`, `len` are 2-aligned, and pattern is 3x power of 2 (at most 2^16).
+  bool fast_path4;
   
+  // `dst` or `len` 1-aligned, or pattern not (1,3)x 2^n, or pattern > (2^16).
+  bool slow_path;
+  
+  // pattern_alignment - 1
+  ushort fast_path12_bitmask;
+  
+  // ctz((pattern_alignment) / 3).
+  ushort fast_path34_power_2;
+  
+  // Full pattern alignment for performing integer modulus.
   uint pattern_alignment;
 };
 
@@ -34,23 +44,38 @@ kernel void fillBuffer
   constant FillArguments &args [[buffer(2)]],
   uint tid [[thread_position_in_grid]])
 {
-  // TODO: Determine whether refactoring control flow improves performance.
   if (args.fast_path1) {
-    ushort index = ushort(tid) & args.fast_path1_bitmask;
+    ushort index = ushort(tid) & args.fast_path12_bitmask;
     uint value = ((constant uint*)pattern)[index];
     ((device uint*)dst)[tid] = value;
-  } else if (args.fast_path2) {
-    uint index = tid % (args.pattern_alignment / 4);
-    uint value = ((constant uint*)pattern)[index];
-    ((device uint*)dst)[tid] = value;
-  } else if (args.fast_path3) {
-    uint index = tid % (args.pattern_alignment / 2);
-    ushort value = ((constant ushort*)pattern)[index];
-    ((device ushort*)dst)[tid] = value;
-  } else {
+    return;
+  }
+  if (args.slow_path) {
     uint index = tid % args.pattern_alignment;
     uchar value = ((constant uchar*)pattern)[index];
     ((device uchar*)dst)[tid] = value;
+    return;
+  }
+  
+  if (args.fast_path2) {
+    ushort index = ushort(tid) & args.fast_path12_bitmask;
+    ushort value = ((constant ushort*)pattern)[index];
+    ((device ushort*)dst)[tid] = value;
+    return;
+  }
+
+  {
+    uint quotient = uint(tid / 3) >> args.fast_path34_power_2;
+    ushort divisor = args.pattern_alignment;
+    ushort index = tid - quotient * divisor;
+    
+    if (args.fast_path3) {
+      uint value = ((constant uint*)pattern)[index];
+      ((device uint*)dst)[tid] = value;
+    } else {
+      ushort value = ((constant ushort*)pattern)[index];
+      ((device ushort*)dst)[tid] = value;
+    }
   }
 }
 
