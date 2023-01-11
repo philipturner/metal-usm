@@ -11,7 +11,7 @@ using namespace metal;
 // Not much value in optimizing edge cases. Promote 1, 2, 3, and 6-byte patterns
 // to 4 or 12. Misaligned addresses (not multiples of 4) take a massive penalty,
 // slower than a blit encoder.
-struct FillArguments {
+struct FillArgumentsOld {
   // `dst`, `len` are 4-aligned, and pattern is 1x power of 2 (at most 2^16).
   bool fast_path1;
   
@@ -41,7 +41,7 @@ kernel void fillBuffer
  (
   constant void *pattern [[buffer(0)]],
   device void *dst [[buffer(1)]],
-  constant FillArguments &args [[buffer(2)]],
+  constant FillArgumentsOld &args [[buffer(2)]],
   uint tid [[thread_position_in_grid]])
 {
   if (args.fast_path1) {
@@ -87,6 +87,17 @@ kernel void copyBufferAligned
   uint tid [[thread_position_in_grid]])
 {
   dst_base[tid] = src_base[tid];
+}
+
+// Use when pattern is 2^n (n=0...5), and output and len are 4-byte aligned.
+kernel void fillBufferAligned
+ (
+  // If pattern < 32 bytes, duplicate it to reach 32 bytes.
+  constant uint *src_base [[buffer(0)]],
+  device uint *dst_base [[buffer(1)]],
+  uint tid [[thread_position_in_grid]])
+{
+  dst_base[tid] = src_base[tid % (32 / 4)];
 }
 
 // Scans multi-GB chunks of memory, reordering memory transactions to fit 64 B
@@ -189,19 +200,107 @@ kernel void copyBufferEdgeCases
   }
   
   // Mask the write, checking both upper and lower bounds.
-  if (dst_index > args.dst_start && dst_index < args.dst_end) {
-    dst_base[dst_index] = data;
+#define WRITE_MASKED \
+  if (dst_index > args.dst_start && dst_index < args.dst_end) { \
+    dst_base[dst_index] = data; \
+  } else { \
+    ushort start = (dst_index < args.dst_start) ? 4 : 0; \
+    ushort end = (dst_index > args.dst_end) ? 0 : 4; \
+    if (dst_index == args.dst_start) { \
+      start = args.dst_start_distance; \
+    } \
+    if (dst_index == args.dst_end) { \
+      end = args.dst_end_distance; \
+    } \
+    for (ushort i = start; i < end; ++i) { \
+      ((device uchar*)dst_base)[dst_index * 4 + i] = data[i]; \
+    } \
+  } \
+
+  WRITE_MASKED;
+}
+
+struct FillArguments {
+  // Offset in 32-bit words, rounded down.
+  uint dst_start;
+  uint dst_end;
+  
+  // Real offset, in absolute bytes after word offset.
+  ushort dst_start_distance;
+  ushort dst_end_distance;
+  
+  // If it exceeds 256*4, read through integer modulus. Otherwise, duplicate
+  // the pattern until reaching threadgroup size.
+  uint pattern_size_words;
+  uint pattern_size_bytes;
+  ushort active_threads;
+  
+  // Whether the pattern fits one threadgroup while being divisible by 4. We
+  // don't have to worry about alignment being incorrect, because it's padded
+  // until the starting chunk boundary.
+  bool pattern_small_and_divisible_4;
+  
+  // If not divisible by 4, first multiply `tid` by 4. Take % pattern_size to
+  // get the first byte's index. Then, read the first 4 consecutive bytes
+  // starting at that index.
+  bool pattern_divisible_4;
+};
+
+// Fast-path for when the pattern is 2^n.
+constant bool pattern_small_and_power_4 [[function_constant(2)]];
+
+// `src_base` and `dst_base` are rounded to 1024-bit chunks.
+//
+// Extend the pattern by 3 bytes after the end. Also extend it arbitrarily far
+// to the front, until reaching the chunk boundary.
+kernel void fillBufferEdgeCases
+ (
+  constant void *src_base [[buffer(0)]],
+  device uchar4 *dst_base [[buffer(1)]],
+  constant FillArguments &args [[buffer(2)]],
+  
+  // Threadgroup size assumed to be 256.
+  uint tid [[thread_position_in_grid]],
+  uint tgid [[threadgroup_position_in_grid]],
+  ushort thread_id [[thread_position_in_threadgroup]])
+{
+  uchar4 data;
+  if (pattern_small_and_power_4) {
+    // Don't check whether you're active, because all threads are.
+    auto src = (constant uchar4*)src_base;
+    data = src[thread_id];
+  } else if (args.pattern_small_and_divisible_4) {
+    if (thread_id >= args.active_threads) {
+      return;
+    }
+    auto src = (constant uchar4*)src_base;
+    data = src[thread_id];
+  } else if (args.pattern_divisible_4) {
+    uint index_start = args.dst_start * 1;
+    uint index = tid - index_start;
+    index %= args.pattern_size_words;
+    index += index_start;
+    
+    auto src = (constant uchar4*)src_base;
+    data = src[index];
   } else {
-    ushort start = (dst_index < args.dst_start) ? 4 : 0;
-    ushort end = (dst_index > args.dst_end) ? 0 : 4;
-    if (dst_index == args.dst_start) {
-      start = args.dst_start_distance;
-    }
-    if (dst_index == args.dst_end) {
-      end = args.dst_end_distance;
-    }
-    for (ushort i = start; i < end; ++i) {
-      ((device uchar*)dst_base)[dst_index * 4 + i] = data[i];
+    uint index_start = args.dst_start * 4 + args.dst_start_distance;
+    uint index = tid * 4 - index_start;
+    index %= args.pattern_size_bytes;
+    index += index_start;
+
+    for (int i = 0; i < 4; ++i) {
+      auto src = (constant uchar*)src_base;
+      data[i] = src[index + i];
     }
   }
+  
+  uint dst_index;
+  if (pattern_small_and_power_4) {
+    dst_index = tgid * 256 + thread_id;
+  } else {
+    dst_index = tgid * args.active_threads + thread_id;
+  }
+  
+  WRITE_MASKED;
 }
