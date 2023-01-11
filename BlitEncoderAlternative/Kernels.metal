@@ -8,12 +8,40 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// Not much value in optimizing memset, especially edge cases.
+// TODO: Ensure the 4-case has similar performance to blit encoder.
+//
+// Alignment - alignment of pattern or destination, whichever is smaller.
+//
+// If pattern is small and not a multiple of 4, try duplicating it.
+// (e.g. AB -> ABAB = 2 -> 4, ABC -> ABCABCABCABC = 3 -> 12)
+// Next, repeat the pattern to match threadgroup size.
+kernel void fillBuffer
+ (
+  constant void *pattern [[buffer(0)]],
+  device void *dst [[buffer(1)]],
+  constant uint &alignment [[buffer(2)]],
+  uint tid [[thread_position_in_grid]],
+  ushort thread_id [[thread_position_in_threadgroup]])
+{
+  if (alignment == 4) {
+    // Use varied threadgroup size to implement integer modulus.
+    // Fastest in the best case, SIMD-divergent in the worst case.
+    uint value = ((constant uint*)pattern)[thread_id];
+    ((device uint*)dst)[tid] = value;
+  } else {
+    // Massive pattern or misaligned destination address.
+    uchar value = ((constant uchar*)pattern)[tid % alignment];
+    ((device uchar*)dst)[tid] = value;
+  }
+}
+
 // Use when input is 4-byte aligned and output is 64-byte aligned.
 kernel void copyBufferAligned
-(
- device uchar4 *src_base [[buffer(0)]],
- device uchar4 *dst_base [[buffer(1)]],
- uint tid [[thread_position_in_grid]])
+ (
+  device uchar4 *src_base [[buffer(0)]],
+  device uchar4 *dst_base [[buffer(1)]],
+  uint tid [[thread_position_in_grid]])
 {
   dst_base[tid] = src_base[tid];
 }
