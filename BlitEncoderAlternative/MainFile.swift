@@ -76,19 +76,17 @@ func mainFunc() {
 // Thoroughly validates a wide range of edge cases, and times them. Compares to
 // the blit encoder. It can also disable the "copyBufferAligned" fast-path.
 func validationTest() {
-  // TODO: Thoroughly validate that fillBuffer works correctly.
-  // TODO: Test various `dstOffset` values (keep `srcOffset` at zero).
-  // TODO: Turn off Metal API Validation.
+  // TODO: Optimize the edge cases by implementing byte_realignment.
   
   let testingPerformance = false
   let bufferSize = testingPerformance ? 256 * 1024 * 1024 : 256 * 1024
   let numTrials = 15
   let numRepetitions = 1
   let doingMemset = true
-  var pattern: [UInt8] = [234, 213]
+  var pattern: [UInt8] = [234, 25, 99, 88]
   
-  let usingAlignedFastPath = true
   let usingBlitEncoder = false
+  let usingAlignedFastPath = true
   let forceUseCustomOffsets = false
   let generateRepeatingPattern = false
   let printArguments = false
@@ -97,7 +95,7 @@ func validationTest() {
   #if true
   let isAligned = true
   let srcOffset = isAligned ? 0 : 128
-  let dstOffset = isAligned ? 0 : 128
+  let dstOffset = isAligned ? 64 : 128
   var customBytesCopied: Int? = nil
   #else
   let srcOffset = Int.random(in: 0..<16384)
@@ -218,10 +216,18 @@ outer:
         thisBytesCopied = bufferSize - max(thisSrcOffset, thisDstOffset)
       }
     } else {
-      thisSrcOffset = Int.random(in: 0..<16384)
+      if doingMemset {
+        thisSrcOffset = 0
+      } else {
+        thisSrcOffset = Int.random(in: 0..<16384)
+      }
       thisDstOffset = Int.random(in: 0..<16384)
       thisBytesCopied = bufferSize - max(thisSrcOffset, thisDstOffset)
       thisBytesCopied -= Int.random(in: 0..<16384)
+    }
+    if doingMemset {
+      precondition(
+        thisSrcOffset == 0, "Memset doesn't support nonzero source offsets.")
     }
     precondition(thisSrcOffset >= 0)
     precondition(thisDstOffset >= 0)
@@ -259,7 +265,7 @@ outer:
           guard pattern.count == 1 else {
             fatalError("Blit encoder doesn't support pattern size > 1.")
           }
-          let range = thisDstOffset..<thisDstOffset + thisDstOffset
+          let range = thisDstOffset..<thisDstOffset + thisBytesCopied
           encoder.fill(buffer: bufferDst, range: range, value: pattern[0])
         } else {
           encoder.copy(
@@ -267,19 +273,101 @@ outer:
             destinationOffset: thisDstOffset, size: thisBytesCopied)
         }
       } else if doingMemset {
-        encoder.setComputePipelineState(fillPipeline)
+        var _pattern = pattern
+        if _pattern.count == 1 || _pattern.count == 3 {
+          _pattern += _pattern
+        }
+        if _pattern.count == 2 || _pattern.count == 6 {
+          _pattern += _pattern
+        }
         
-//        var patternAlignment: Int
-//        var targetThreadgroupSize: Int
-//        if pattern.count % 4 == 0 {
-//
-//        } else if pattern.count * 4 < 256 * 4 {
-//
-//        } else if pattern.count * 4 < 768 * 4 {
-//
-//        } else {
-//          // Bind the pattern itself to the compute encoder.
-//        }
+        struct FillArguments {
+          var fast_path1: Bool = false
+          var fast_path2: Bool = false
+          var fast_path3: Bool = false
+          var fast_path4: Bool = false
+          var slow_path: Bool = false
+          
+          var fast_path12_bitmask: UInt16 = 0
+          var fast_path34_power_2: UInt16 = 0
+          var pattern_alignment: UInt32 = 0
+        }
+        var arguments = FillArguments()
+        
+        var is_1_power_2 = false
+        var is_3_power_2 = false
+        if _pattern.count % 4 == 0,
+           _pattern.count <= Int(UInt16.max) + 1 {
+          if _pattern.count.nonzeroBitCount == 1 {
+            is_1_power_2 = true
+          } else if _pattern.count % 3 == 0,
+                    (_pattern.count / 3).nonzeroBitCount == 1 {
+            is_3_power_2 = true
+            precondition(
+              _pattern.count.nonzeroBitCount == 2 &&
+              _pattern.count.trailingZeroBitCount +
+              _pattern.count.leadingZeroBitCount == 62,
+            "Pattern was not 3*2^n")
+          }
+        }
+        
+        var numThreads: Int
+        let dstAddress = bufferDst.gpuAddress + UInt64(thisDstOffset)
+        if dstAddress % 4 == 0,
+           thisBytesCopied % 4 == 0,
+           is_1_power_2 {
+          arguments.fast_path1 = true
+          arguments.pattern_alignment = UInt32(_pattern.count / 4);
+          numThreads = thisBytesCopied / 4
+        } else if dstAddress % 2 == 0,
+                  thisBytesCopied % 2 == 0,
+                  is_1_power_2 {
+          arguments.fast_path2 = true
+          arguments.pattern_alignment = UInt32(_pattern.count / 2)
+          numThreads = thisBytesCopied / 2
+        } else if dstAddress % 4 == 0,
+                  thisBytesCopied % 4 == 0,
+                  is_3_power_2 {
+          arguments.fast_path3 = true
+          arguments.pattern_alignment = UInt32(_pattern.count / 4)
+          numThreads = thisBytesCopied / 4
+        } else if dstAddress % 2 == 0,
+                  thisBytesCopied % 2 == 0,
+                  is_3_power_2 {
+          arguments.fast_path4 = true
+          arguments.pattern_alignment = UInt32(_pattern.count / 2)
+          numThreads = thisBytesCopied / 2
+        } else {
+          arguments.slow_path = true
+          arguments.pattern_alignment = UInt32(_pattern.count)
+          numThreads = thisBytesCopied
+        }
+        arguments.fast_path12_bitmask =
+          UInt16(truncatingIfNeeded: arguments.pattern_alignment - 1)
+        var power_2: Int
+        if (is_3_power_2) {
+          power_2 = (arguments.pattern_alignment / 3).trailingZeroBitCount
+        } else {
+          power_2 = (arguments.pattern_alignment / 1).trailingZeroBitCount
+        }
+        arguments.fast_path34_power_2 = UInt16(power_2)
+        
+        let argumentsLength = MemoryLayout<FillArguments>.stride
+        if printArguments {
+          print(arguments)
+          print("Pattern:", _pattern)
+          print("Num Threads:", numThreads)
+          print("Dst offset: \(thisDstOffset)")
+          print("Bytes copied: \(thisBytesCopied)")
+        }
+        
+        encoder.setComputePipelineState(fillPipeline)
+        encoder.setBytes(&_pattern, length: _pattern.count, index: 0)
+        encoder.setBuffer(bufferDst, offset: thisDstOffset, index: 1)
+        encoder.setBytes(&arguments, length: argumentsLength, index: 2)
+        encoder.dispatchThreads(
+          MTLSizeMake(numThreads, 1, 1),
+          threadsPerThreadgroup: MTLSizeMake(256, 1, 1))
       } else {
         var useFastPath = false
         if usingAlignedFastPath {
